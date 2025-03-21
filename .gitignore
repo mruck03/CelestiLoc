@@ -1,0 +1,9 @@
+fits_files/*
+
+__pycache__
+
+*.pyc
+
+out/*
+
+.vscode/*

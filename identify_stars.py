@@ -6,7 +6,7 @@ from astroquery.gaia import Gaia
 import astropy.units as u
 from astropy.coordinates import SkyCoord
 from tqdm import tqdm
-
+import open3d as o3d
 
 def read_rdls_file(file_path):
     hdul = fits.open(file_path)
@@ -34,6 +34,8 @@ def read_xyls_file(file_path):
 
 def plot_data(img, star_data, save_path="out/stars_identified.jpg"):
 
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
     out_image = np.array(img)
     for x, y, ra, dec in star_data:
         x = round(x)
@@ -52,7 +54,7 @@ def get_star_distance(star_data):
         # Set up the coordinates for RA/Dec (in degrees)
         coords = SkyCoord(ra=ra, dec=dec, unit=(u.deg, u.deg), frame='icrs')
         
-        radius_deg = 1.0 / 60.0  # 1 arcminute in degrees
+        radius_deg = 1.0 / 30.0  # 1 arcminute in degrees
         
         # Corrected ADQL query with CIRCLE and ORDER BY DISTANCE
         query = f"""
@@ -91,6 +93,33 @@ def get_star_distance(star_data):
             dists.append(None)
 
     return dists
+
+def celestial_to_cartesian(ra, dec, dist):
+    x = dist * np.cos(np.deg2rad(dec)) * np.cos(np.deg2rad(ra))
+    y = dist * np.cos(np.deg2rad(dec)) * np.sin(np.deg2rad(ra))
+    z = dist * np.sin(np.deg2rad(dec))
+
+    return x, y, z
+def plot_3d_pose(star_data, scale=1):
+    x, y, z = celestial_to_cartesian(star_data[:, 2], star_data[:, 3], star_data[:, 4])
+
+    # Rescale for visualization
+    pc = np.vstack((x, y, z)).T * scale
+
+    # Create Open3D point cloud
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(pc)
+
+    # # Set colors for stars (white)
+    # colors = np.ones_like(pc)  # All stars white
+    # pcd.colors = o3d.utility.Vector3dVector(colors)
+
+    # Create coordinate frame (origin)
+    axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1, origin=[0, 0, 0])
+
+    # Visualize
+    o3d.visualization.draw_geometries([pcd, axis])
+
 
 def main():
 
@@ -132,10 +161,15 @@ def main():
     print("Processing stars for Distances")
     dists = get_star_distance(star_data)
 
+    #Star data: (x, y, ra, dec, dist (m))
     star_data = np.vstack((star_data.T, np.array(dists))).T
     star_data = star_data[star_data[:, 4] != None]
 
     print(star_data.shape)
+    star_data = star_data.astype(float)
+
+    plot_3d_pose(star_data)
+
 
 if __name__ == "__main__":
     Gaia.TIMEOUT = 120  # Increase timeout to 2 minutes

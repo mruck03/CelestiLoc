@@ -25,12 +25,19 @@ To create fits file for use, run astrometry solver on image:
 (NOTE: You need to download indexs so it can solve for stars. I used these: https://data.astrometry.net/4100/)
 
 ```
-solve-field fits_files test2.jpg
+solve-field fits_files/test2.jpg
 ```
 
 This will create the .rdls (viewing angle of stars) and .xyls (index of stars in image) files we need for processing stars.
 
 ### Running code
+
+Before running anything, make sure to create input and output folders
+```
+mkdir fits_files
+mkdir out
+```
+The fits_files holds the fits data processed by astrometry.net. The out file is where output files are saved.
 
 To run code, simply change the file_name in the python script and run
 ```

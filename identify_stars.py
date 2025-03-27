@@ -123,7 +123,7 @@ def plot_3d_pose(star_data, scale=1):
 
 def main():
 
-    image_name = "test2" #INPUT IMAGE NAME
+    image_name = "dark" #INPUT IMAGE NAME
 
     # Open the .rdls file
     fits_dir = "fits_files"

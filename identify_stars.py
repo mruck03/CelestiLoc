@@ -7,6 +7,7 @@ import astropy.units as u
 from astropy.coordinates import SkyCoord
 from tqdm import tqdm
 import open3d as o3d
+from image_filter import K
 
 def read_rdls_file(file_path):
     hdul = fits.open(file_path)
@@ -120,10 +121,38 @@ def plot_3d_pose(star_data, scale=1):
     # Visualize
     o3d.visualization.draw_geometries([pcd, axis])
 
+def solve_pnp(object_points, image_points, camera_matrix, dist_coeffs=None, method=cv2.SOLVEPNP_ITERATIVE):
+    """
+    Solves the Perspective-n-Point (PnP) problem to estimate camera pose.
+
+    Parameters:
+    - object_points: (Nx3 array) 3D points in the world frame.
+    - image_points: (Nx2 array) 2D points in the image frame.
+    - camera_matrix: (3x3 array) Camera intrinsic matrix.
+    - dist_coeffs: (optional, default=None) Distortion coefficients (set to None if no distortion).
+    - method: (default=cv2.SOLVEPNP_ITERATIVE) Method for solving PnP (e.g., cv2.SOLVEPNP_EPNP, cv2.SOLVEPNP_ITERATIVE, cv2.SOLVEPNP_AP3P).
+
+    Returns:
+    - success: Boolean indicating if solving was successful.
+    - rvec: (3x1 array) Rotation vector.
+    - tvec: (3x1 array) Translation vector.
+    """
+    object_points = np.array(object_points, dtype=np.float32)
+    image_points = np.array(image_points, dtype=np.float32)
+
+    print(object_points.shape)
+    
+    if dist_coeffs is None:
+        dist_coeffs = np.zeros((4,1))  # Assuming no distortion if not provided
+    
+    success, rvec, tvec = cv2.solvePnP(object_points, image_points, camera_matrix, dist_coeffs, flags=method)
+    
+    return success, rvec, tvec
+
 
 def main():
 
-    image_name = "dark" #INPUT IMAGE NAME
+    image_name = "enhanced_iphone" #INPUT IMAGE NAME
 
     # Open the .rdls file
     fits_dir = "fits_files"
@@ -170,6 +199,41 @@ def main():
 
     plot_3d_pose(star_data)
 
+    x, y, z = celestial_to_cartesian(star_data[:, 2], star_data[:, 3], star_data[:, 4])
+    scale_factor = np.linalg.norm(np.vstack((x, y, z)), axis=0).max()
+    
+    print(f"Scale Factor: {scale_factor}")
+
+    x /= scale_factor
+    y /= scale_factor
+    z /= scale_factor
+
+    success, rvec, t = solve_pnp(np.vstack((x, y, z)).T, star_data[:, :2], K, method=cv2.SOLVEPNP_EPNP)
+    if success:
+        tvec *= scale_factor
+
+    print("PnP output")
+    print(success)
+    print(rvec)
+    print(t)
+
+    R, _ = cv2.Rodrigues(rvec)
+
+    T = np.eye(4)
+    T[:3, :3] = R
+    T[:3, 3] = t.flatten()
+
+    print("Transformation Matrix")
+    print(T)
+
+    #Vizualize
+    frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.0)
+    frame.transform(T)
+
+    # axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1, origin=[0, 0, 0])
+
+    # Visualize the transformed coordinate frame
+    # o3d.visualization.draw_geometries([frame, axis], window_name="Transformed Frame")
 
 if __name__ == "__main__":
     Gaia.TIMEOUT = 120  # Increase timeout to 2 minutes

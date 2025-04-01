@@ -210,7 +210,7 @@ def main():
 
     success, rvec, t = solve_pnp(np.vstack((x, y, z)).T, star_data[:, :2], K, method=cv2.SOLVEPNP_EPNP)
     if success:
-        tvec *= scale_factor
+        t *= scale_factor
 
     print("PnP output")
     print(success)

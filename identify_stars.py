@@ -8,6 +8,9 @@ from astropy.coordinates import SkyCoord
 from tqdm import tqdm
 import open3d as o3d
 from image_filter import K
+from scipy.spatial.transform import Rotation as R
+from scipy.optimize import least_squares, minimize
+
 
 def read_rdls_file(file_path):
     hdul = fits.open(file_path)
@@ -145,10 +148,167 @@ def solve_pnp(object_points, image_points, camera_matrix, dist_coeffs=None, meth
     if dist_coeffs is None:
         dist_coeffs = np.zeros((4,1))  # Assuming no distortion if not provided
     
-    success, rvec, tvec = cv2.solvePnP(object_points, image_points, camera_matrix, dist_coeffs, flags=method)
+    success, rvec, tvec, _ = cv2.solvePnPRansac(object_points, image_points, camera_matrix, dist_coeffs)
+    # success, rvec, tvec, inliers = cv2.solvePnPRansac(
+    # object_points, image_points, camera_matrix, dist_coeffs, 
+    # rvec=None, tvec=None, useExtrinsicGuess=False, iterationsCount=100, 
+    # reprojectionError=8.0, confidence=0.99, flags=method
+    # )
     
     return success, rvec, tvec
 
+def quaternion_to_transformation_matrix(quaternion, translation):
+    """
+    Converts a quaternion and a translation vector into a 4x4 transformation matrix.
+    
+    Args:
+        quaternion: (w, x, y, z) tuple or list
+        translation: (tx, ty, tz) tuple or list
+    
+    Returns:
+        4x4 NumPy array representing the transformation matrix.
+    """
+    # Convert quaternion to rotation matrix
+    r = R.from_quat(quaternion)  # SciPy uses (x, y, z, w)
+    R_matrix = r.as_matrix()  # 3x3 rotation matrix
+    
+    # Construct 4x4 transformation matrix
+    T = np.eye(4)
+    T[:3, :3] = R_matrix
+    T[:3, 3] = translation
+    
+    return T
+
+def residual_quaternion_R(params, t, img_pts, star_pts, camera_matrix):
+    """
+    Computes the residuals between transformed points in frame A and points in frame B using a quaternion.
+
+    Args:
+        params (np.ndarray): Optimization parameters (first 4 values are quaternion, last 3 are translation).
+        img_pts (np.ndarray): Array of shape (N, 2) representing indexes of image
+        points_b (np.ndarray): Array of shape (N, 3) representing points of stars in world frame
+
+    Returns:
+        np.ndarray: Residuals (differences) between transformed points_a and points_b.
+    """
+    # Extract quaternion and translation parameters
+    rvec = params
+
+    # Ensure quaternion is normalized
+    R, _ = cv2.Rodrigues(rvec)
+
+    T = np.eye(4)
+    T[:3, :3] = R
+    T[:3, 3] = t
+            
+    star_pts_homo = np.vstack((star_pts.T, np.ones((1, star_pts.shape[0]))))
+    
+    proj_points = camera_matrix @ T[:3, :] @ star_pts_homo
+    proj_points = proj_points[:2, :] / proj_points[2, :]
+    proj_points = proj_points.T
+
+    return ((proj_points - img_pts)**2).flatten()
+
+def residual_quaternion_t(params, rvec, img_pts, star_pts, camera_matrix):
+    """
+    Computes the residuals between transformed points in frame A and points in frame B using a quaternion.
+
+    Args:
+        params (np.ndarray): Optimization parameters (first 4 values are quaternion, last 3 are translation).
+        img_pts (np.ndarray): Array of shape (N, 2) representing indexes of image
+        points_b (np.ndarray): Array of shape (N, 3) representing points of stars in world frame
+
+    Returns:
+        np.ndarray: Residuals (differences) between transformed points_a and points_b.
+    """
+    # Extract quaternion and translation parameters
+    t = params
+
+    # Ensure quaternion is normalized
+    R, _ = cv2.Rodrigues(rvec)
+
+    T = np.eye(4)
+    T[:3, :3] = R
+    T[:3, 3] = t
+            
+    star_pts_homo = np.vstack((star_pts.T, np.ones((1, star_pts.shape[0]))))
+    
+    proj_points = camera_matrix @ T[:3, :] @ star_pts_homo
+    proj_points = proj_points[:2, :] / proj_points[2, :]
+    proj_points = proj_points.T
+
+    return ((proj_points - img_pts)**2).flatten()
+
+def solve_least_squares(object_points, image_points, camera_matrix, iters=1000, dist_coeffs=None):
+
+    initial_rvec = np.array([0.0, 0.0, 0.0]) 
+    initial_translation = np.array([0.0, 0.0, 0.0])
+    initial_params = np.hstack((initial_rvec, initial_translation))
+
+    # Define bounds for quaternion and translation parameters
+    rvec_bounds = (-1, 1)  # Example bounds for quaternion values (to keep normalized)
+    translation_bounds = ([-2, -2, -2], [2, 2, 2])  # Set bounds for translation (adjust as needed)
+
+    # Combine bounds for all parameters
+    lower_bounds = np.hstack((np.full(3, rvec_bounds[0]), translation_bounds[0]))
+    upper_bounds = np.hstack((np.full(3, rvec_bounds[1]), translation_bounds[1]))
+
+    # Optimize the parameters to minimize residuals
+    result = least_squares(residual_quaternion_R, initial_rvec, args=(initial_translation, image_points, object_points, camera_matrix), bounds=(np.full(3, rvec_bounds[0]), (np.full(3, rvec_bounds[1]))))
+    optimized_rvec = result.x
+
+    result = least_squares(residual_quaternion_t, initial_translation, args=(optimized_rvec, image_points, object_points, camera_matrix), bounds=(translation_bounds[0], translation_bounds[1]))
+    optimized_t = result.x
+
+    result = least_squares(residual_quaternion_R, optimized_rvec, args=(optimized_t, image_points, object_points, camera_matrix), bounds=(np.full(3, rvec_bounds[0]), (np.full(3, rvec_bounds[1]))))
+    optimized_rvec = result.x
+
+    mean, err = compute_reprojection_error(object_points, image_points, optimized_rvec, optimized_t, camera_matrix)
+    
+    # while mean > 10 and cur_iters < iters:
+    #     initial_params = np.hstack((optimized_rvec, optimized_t))
+    #     result = least_squares(residual_quaternion, initial_params, args=(image_points, object_points, camera_matrix), bounds=(lower_bounds, upper_bounds))
+    #     optimized_rvec = result.x[:3]
+    #     optimized_t = result.x[3:6]
+    #     mean, err = compute_reprojection_error(object_points, image_points, optimized_rvec, optimized_t, camera_matrix)
+    #     cur_iters += 1
+    #     print(mean)
+
+    return optimized_rvec, optimized_t
+
+def compute_reprojection_error(object_points, image_points, rvec, tvec, K, dist_coeffs=None):
+    """
+    Computes the reprojection error for a given set of 3D points and their corresponding 2D image points.
+
+    Parameters:
+    - object_points: (N, 3) numpy array of 3D world (or ECI) points
+    - image_points: (N, 2) numpy array of corresponding 2D image points
+    - rvec: Rotation vector (3, 1) from solvePnP
+    - tvec: Translation vector (3, 1) from solvePnP
+    - K: (3, 3) Camera intrinsic matrix
+    - dist_coeffs: (5, 1) Distortion coefficients (set to None if no distortion)
+
+    Returns:
+    - mean_error: The mean reprojection error across all points
+    - errors: List of individual reprojection errors for each point
+    """
+
+    # Convert rotation vector to rotation matrix
+    R, _ = cv2.Rodrigues(rvec)
+
+    # Project the 3D object points into the image plane
+    projected_points, _ = cv2.projectPoints(object_points, rvec, tvec, K, dist_coeffs)
+
+    # Reshape projected points to (N, 2)
+    projected_points = projected_points.reshape(-1, 2)
+
+    # Compute the Euclidean distance between observed and projected points
+    errors = np.linalg.norm(image_points - projected_points, axis=1)
+
+    # Compute the mean error
+    mean_error = np.mean(errors)
+
+    return mean_error, errors
 
 def main():
 
@@ -188,34 +348,28 @@ def main():
 
     #Get Star Distances:
     print("Processing stars for Distances")
-    dists = get_star_distance(star_data)
+    dists = np.array(get_star_distance(star_data))
+    # dists = np.ones((1, star_data.shape[0]))*10
 
     #Star data: (x, y, ra, dec, dist (m))
-    star_data = np.vstack((star_data.T, np.array(dists))).T
+    star_data = np.vstack((star_data.T, dists)).T
     star_data = star_data[star_data[:, 4] != None]
+    star_data[:, 4] /= star_data[:, 4].max()
+    star_data[:, 4] *= 1000
 
     print(star_data.shape)
     star_data = star_data.astype(float)
 
-    plot_3d_pose(star_data)
+    # plot_3d_pose(star_data)
 
     x, y, z = celestial_to_cartesian(star_data[:, 2], star_data[:, 3], star_data[:, 4])
-    scale_factor = np.linalg.norm(np.vstack((x, y, z)), axis=0).max()
-    
-    print(f"Scale Factor: {scale_factor}")
+    # success, rvec, t = solve_pnp(np.vstack((x, y, z)).T, star_data[:, :2], K)
 
-    x /= scale_factor
-    y /= scale_factor
-    z /= scale_factor
+    rvec, t = solve_least_squares(np.vstack((x, y, z)).T, star_data[:, :2], K)
 
-    success, rvec, t = solve_pnp(np.vstack((x, y, z)).T, star_data[:, :2], K, method=cv2.SOLVEPNP_EPNP)
-    if success:
-        t *= scale_factor
-
-    print("PnP output")
-    print(success)
     print(rvec)
-    print(t)
+    mean_err, errs = compute_reprojection_error(np.vstack((x, y, z)).T, star_data[:, :2], rvec, t, K)
+    print(f"Reprojection Error: {mean_err}")
 
     R, _ = cv2.Rodrigues(rvec)
 
@@ -223,17 +377,31 @@ def main():
     T[:3, :3] = R
     T[:3, 3] = t.flatten()
 
+    # T = quaternion_to_transformation_matrix(q, t)
+
     print("Transformation Matrix")
     print(T)
 
     #Vizualize
-    frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.0)
-    frame.transform(T)
+    frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5)
+    frame.transform(np.linalg.inv(T))
 
-    # axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1, origin=[0, 0, 0])
+    axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1, origin=[0, 0, 0])
 
     # Visualize the transformed coordinate frame
-    # o3d.visualization.draw_geometries([frame, axis], window_name="Transformed Frame")
+
+    pc = np.vstack((x, y, z)).T
+
+    # Create Open3D point cloud
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(pc)
+
+    # # Set colors for stars (white)
+    # colors = np.ones_like(pc)  # All stars white
+    # pcd.colors = o3d.utility.Vector3dVector(colors)
+
+    # Create coordinate frame (origin)
+    o3d.visualization.draw_geometries([frame, axis, pcd])
 
 if __name__ == "__main__":
     Gaia.TIMEOUT = 120  # Increase timeout to 2 minutes

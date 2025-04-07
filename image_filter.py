@@ -49,7 +49,7 @@ def enhance_stars(image):
 if __name__ == "__main__":
     # Example usage
     dir = "fits_files"
-    image_name = "cale_test3.jpg"  # Replace with your image file
+    image_name = "iphone.jpg"  # Replace with your image file
     img_path = os.path.join(dir, image_name)
 
     #Saved an enhanced image
@@ -58,7 +58,7 @@ if __name__ == "__main__":
     undistorted_image = cv2.undistort(img, K, D)
     # result = enhance_stars(undistorted_image)
     result = undistorted_image
-    save_path = os.path.join(dir, f"cale_test3_enhanced.jpg")
+    save_path = os.path.join(dir, f"enhanced_iphone.jpg")
 
     # Save the result
     if result is not None:

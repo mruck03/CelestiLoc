@@ -10,6 +10,7 @@ import open3d as o3d
 from image_filter import K
 from scipy.spatial.transform import Rotation as R
 from scipy.optimize import least_squares, minimize
+from astropy.time import Time
 
 
 def read_rdls_file(file_path):
@@ -153,12 +154,34 @@ def get_star_distance(star_data):
 
     return dists
 
+
 def celestial_to_cartesian(ra, dec, dist):
     x = dist * np.cos(np.deg2rad(dec)) * np.cos(np.deg2rad(ra))
     y = dist * np.cos(np.deg2rad(dec)) * np.sin(np.deg2rad(ra))
     z = dist * np.sin(np.deg2rad(dec))
-
     return x, y, z
+
+def celestial_to_ecef(star_data, time_str="2025-04-01T04:00:00"):
+
+    obs_time = Time(time_str)
+
+    gst = obs_time.sidereal_time('mean', longitude=0)  # GST in hours
+    gst_rad = gst.to(u.rad)
+
+    rotation_matrix = np.array([
+        [np.cos(gst_rad), np.sin(gst_rad), 0],
+        [-np.sin(gst_rad), np.cos(gst_rad), 0],
+        [0, 0, 1]
+    ])
+
+    x, y, z = celestial_to_cartesian(star_data[:, 2], star_data[:, 3], star_data[:, 4])
+
+    star_coords = np.vstack((x, y, z))
+
+    star_coords_adj = rotation_matrix @ star_coords
+
+    return star_coords_adj.T
+
 def plot_3d_pose(star_data, scale=1):
     x, y, z = celestial_to_cartesian(star_data[:, 2], star_data[:, 3], star_data[:, 4])
 
@@ -274,16 +297,11 @@ def residual_quaternion(params, img_pts, star_pts, camera_matrix):
         np.ndarray: Residuals (differences) between transformed points_a and points_b.
     """
     # Extract quaternion and translation parameters
-    rvec = params[:3]
-    lat, lon = params[3:]
+    quat = params[:4]
+    lat, lon = params[4:]
 
     t = lla_to_ecef(lat, lon)
-    R, _ = cv2.Rodrigues(rvec)
-
-
-    cam_2_world = np.eye(4)
-    cam_2_world[:3, :3] = R
-    cam_2_world[3, :3] = t
+    cam_2_world = quaternion_to_transformation_matrix(quat, t)
 
     world_2_cam = np.linalg.inv(cam_2_world)
 
@@ -299,22 +317,56 @@ def residual_quaternion(params, img_pts, star_pts, camera_matrix):
     # mean_error, _ = compute_reprojection_error(star_pts, img_pts, rvec, t, camera_matrix)
     print(f"Current Lat: {np.degrees(lat)}, Lon: {np.degrees(lon)}, Residual: {mean_error}")
 
-    return mean_error
+    return errors
+
+def residual_quaternion_t(params, quat, img_pts, star_pts, camera_matrix):
+    """
+    Computes the residuals between transformed points in frame A and points in frame B using a quaternion.
+
+    Args:
+        params (np.ndarray): Optimization parameters (first 4 values are quaternion, last 3 are translation).
+        img_pts (np.ndarray): Array of shape (N, 2) representing indexes of image
+        points_b (np.ndarray): Array of shape (N, 3) representing points of stars in world frame
+
+    Returns:
+        np.ndarray: Residuals (differences) between transformed points_a and points_b.
+    """
+    # Extract quaternion and translation parameters
+    lat, lon = params
+
+    t = lla_to_ecef(lat, lon)
+    cam_2_world = quaternion_to_transformation_matrix(quat, t)
+
+    world_2_cam = np.linalg.inv(cam_2_world)
+
+    star_pts_homo = np.vstack((star_pts.T, np.ones(star_pts.shape[0])))
+    proj_points = camera_matrix @ world_2_cam[:3, :] @ star_pts_homo
+    proj_points = (proj_points[:2, :] / proj_points[2, :]).T
+
+    errors = np.linalg.norm(img_pts - proj_points, axis=1)
+
+    # Compute the mean error
+    mean_error = np.mean(errors)
+
+    # mean_error, _ = compute_reprojection_error(star_pts, img_pts, rvec, t, camera_matrix)
+    print(f"Current Lat: {np.degrees(lat)}, Lon: {np.degrees(lon)}, Residual: {mean_error}")
+
+    return errors
 
 
 def solve_least_squares(object_points, image_points, camera_matrix, dist_coeffs=None):
 
-    initial_rvec = np.array([0.0, 0.0, 0.0]) 
+    initial_quat = np.array([0.0, 0.0, 0.0, 1.0]) 
     initial_translation = np.deg2rad(np.array([42.0, -83.0])) # (latitude, longitude)
-    initial_params = np.hstack((initial_rvec, initial_translation))
+    initial_params = np.hstack((initial_quat, initial_translation))
 
     # Define bounds for quaternion and translation parameters
-    rvec_bounds = (-np.pi, np.pi)  # Example bounds for quaternion values (to keep normalized)
-    translation_bounds = ([-np.pi/2, None], [np.pi/2, None])  # Set bounds for translation (adjust as needed)
+    quat_bounds = (-1, 1)  # Example bounds for quaternion values (to keep normalized)
+    translation_bounds = ([-np.pi/2, -np.inf], [np.pi/2, np.inf])  # Set bounds for translation (adjust as needed)
 
     # Combine bounds for all parameters
-    lower_bounds = np.hstack((np.full(3, rvec_bounds[0]), translation_bounds[0]))
-    upper_bounds = np.hstack((np.full(3, rvec_bounds[1]), translation_bounds[1]))
+    lower_bounds = np.hstack((np.full(4, quat_bounds[0]), translation_bounds[0]))
+    upper_bounds = np.hstack((np.full(4, quat_bounds[1]), translation_bounds[1]))
     bounds = list(zip(lower_bounds, upper_bounds))
 
     options = {
@@ -322,54 +374,27 @@ def solve_least_squares(object_points, image_points, camera_matrix, dist_coeffs=
         # 'fatol': 1e-100,   # Absolute tolerance on objective function value
         'maxiter': 1000,  # Maximum number of iterations
         'disp': True,      # Display optimization process
-        'line_search':'strong_wolfe'
+        # 'line_search':'strong_wolfe'
     }
 
-    result = minimize(
-        lambda x: residual_quaternion(x, image_points, object_points, camera_matrix),
-        initial_params,
-        options = options,
-        bounds=bounds,
-        method= "BFGS"#'Nelder-Mead'#"L-BFGS-B" # or 'TNC', 'SLSQP', etc., #TODO: Mess around with these to see which is best
-    )
-    # result = least_squares(residual_quaternion, initial_rvec, args=(initial_translation, image_points, object_points, camera_matrix), bounds=(np.full(3, rvec_bounds[0]), (np.full(3, rvec_bounds[1]))))
-    optimized_rvec = result.x[:3]
-    optimized_t = result.x[3:]
+    # result = minimize(
+    #     lambda x: residual_quaternion(x, image_points, object_points, camera_matrix),
+    #     initial_params,
+    #     options = options,
+    #     bounds=bounds,
+    #     method= "L-BFGS-B" #"BFGS"#'Nelder-Mead'#"L-BFGS-B" # or 'TNC', 'SLSQP', etc., #TODO: Mess around with these to see which is best
+    # )
+    print("Optimizing for Both")
+    result = least_squares(residual_quaternion, initial_params, args=(image_points, object_points, camera_matrix), bounds=(lower_bounds, upper_bounds), method="dogbox")
+    optimized_quat = result.x[:4]
+    optimized_t = result.x[4:]
+
+    print("Optimization for Lat/Lon")
+    result = least_squares(residual_quaternion_t, optimized_t, args=(optimized_quat, image_points, object_points, camera_matrix), bounds=(translation_bounds[0], translation_bounds[1]), method="dogbox", diff_step=1e-4)
 
     #TODO: Maybe optimize rotation and then translation????
 
-    return optimized_rvec, optimized_t
-
-def compute_reprojection_error(object_points, image_points, rvec, tvec, K, dist_coeffs=None):
-    """
-    Computes the reprojection error for a given set of 3D points and their corresponding 2D image points.
-
-    Parameters:
-    - object_points: (N, 3) numpy array of 3D world (or ECI) points
-    - image_points: (N, 2) numpy array of corresponding 2D image points
-    - rvec: Rotation vector (3, 1) from solvePnP
-    - tvec: Translation vector (3, 1) from solvePnP
-    - K: (3, 3) Camera intrinsic matrix
-    - dist_coeffs: (5, 1) Distortion coefficients (set to None if no distortion)
-
-    Returns:
-    - mean_error: The mean reprojection error across all points
-    - errors: List of individual reprojection errors for each point
-    """
-
-    # Project the 3D object points into the image plane
-    projected_points, _ = cv2.projectPoints(object_points, rvec, tvec, K, dist_coeffs)
-
-    # Reshape projected points to (N, 2)
-    projected_points = projected_points.reshape(-1, 2)
-
-    # Compute the Euclidean distance between observed and projected points
-    errors = np.linalg.norm(image_points - projected_points, axis=1)
-
-    # Compute the mean error
-    mean_error = np.mean(errors)
-
-    return mean_error, errors
+    return optimized_quat, optimized_t
 
 
 
@@ -380,52 +405,57 @@ def main():
     
     star_data = load_star_data(image_name, fits_dir)
 
-    x, y, z = celestial_to_cartesian(star_data[:, 2], star_data[:, 3], star_data[:, 4])
+    stars_metric = celestial_to_ecef(star_data)
+
+    # x, y, z = celestial_to_cartesian(star_data[:, 2], star_data[:, 3], star_data[:, 4])
+    # x, y, z = celestial_to_cartesian(ra_adjusted, dec_adjusted, star_data[:, 4])
     # success, rvec, t = solve_pnp(np.vstack((x, y, z)).T, star_data[:, :2], K)
 
-    rvec, pos = solve_least_squares(np.vstack((x, y, z)).T, star_data[:, :2], K)
+    # quat, pos = solve_least_squares(np.vstack((x, y, z)).T, star_data[:, :2], K)
+    quat, pos = solve_least_squares(stars_metric, star_data[:, :2], K)
     t = lla_to_ecef(pos[0], pos[1])
 
-    print(f"Rotation Vector: {rvec}")
+    print(f"Rotation Vector: {quat}")
     print(f"(Lat, Lon): {np.degrees(pos)}")
-    mean_err, errs = compute_reprojection_error(np.vstack((x, y, z)).T, star_data[:, :2], rvec, t, K)
-    print(f"Reprojection Error: {mean_err}")
 
-    R, _ = cv2.Rodrigues(rvec)
-
-    T = np.eye(4)
-    T[:3, :3] = R
-    T[:3, 3] = t.flatten() / np.linalg.norm(t)
-
-    # T = quaternion_to_transformation_matrix(q, t)
+    T = quaternion_to_transformation_matrix(quat, t/np.linalg.norm(t))
 
     print("Transformation Matrix")
     print(T)
 
     #Vizualize
-    frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5)
+    frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.7)
     frame.transform(T)
 
-    axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1, origin=[0, 0, 0])
+    axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.5, origin=[0, 0, 0])
 
     # Visualize the transformed coordinate frame
     star_dist_norm = star_data[:, 4] / star_data[:, 4].max()
-    star_dist_norm *= 10
+    star_dist_norm += 10
 
     x_norm, y_norm, z_norm = celestial_to_cartesian(star_data[:, 2], star_data[:, 3], star_dist_norm)
+    star_data[:, 4] = star_dist_norm
+    stars_metric_norm = celestial_to_ecef(star_data)
+
 
     pc = np.vstack((x_norm, y_norm, z_norm)).T
+    pc_adj = stars_metric_norm
     print(pc.shape)
 
     # Create Open3D point cloud
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(pc)
-    # # Set colors for stars (white)
-    # colors = np.ones_like(pc)  # All stars white
-    # pcd.colors = o3d.utility.Vector3dVector(colors)
+    pcd.colors = o3d.utility.Vector3dVector(np.ones((len(pc), 3)) * [1, 0, 0])
+
+    pcd_adj = o3d.geometry.PointCloud()
+    pcd_adj.points = o3d.utility.Vector3dVector(pc_adj)
+    pcd_adj.colors = o3d.utility.Vector3dVector(np.ones((len(pc_adj), 3)) * [0, 0, 1])
+
+    earth = o3d.geometry.TriangleMesh.create_sphere(radius=1.0, resolution=20)
+    
 
     # Create coordinate frame (origin)
-    o3d.visualization.draw_geometries([frame, axis, pcd])
+    o3d.visualization.draw_geometries([frame, axis, pcd, pcd_adj, earth])
 
 
 if __name__ == "__main__":

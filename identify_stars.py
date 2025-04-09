@@ -11,6 +11,7 @@ from image_filter import K
 from scipy.spatial.transform import Rotation as R
 from scipy.optimize import least_squares, minimize
 from astropy.time import Time
+from datetime import datetime, timezone, timedelta
 
 
 def read_rdls_file(file_path):
@@ -85,12 +86,33 @@ def load_star_data(image_name, fits_dir):
         # star_data[:, 4] /= star_data[:, 4].max()
         # star_data[:, 4] *= 1000
 
-        print(star_data.shape)
+        # print(star_data.shape)
         star_data = star_data.astype(float)
 
         np.savetxt(f"out/{image_name}_star_data.csv", star_data, delimiter=',', fmt='%.6f')
 
     return star_data
+
+def get_image_timestamp(txt_path, image_filename, default_time="2025-04-01 04:00:00"):
+    with open(txt_path, "r") as f:
+        lines = f.readlines()
+
+    print(lines)
+    for line in lines:
+        parts = line.strip().split(",")
+        if len(parts) >= 2:
+            name = parts[0].strip()
+            ts = parts[1].strip()
+            print(name, image_filename)
+            if name == image_filename:
+                dt_est = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+                dt_utc = dt_est + timedelta(hours=4)  #EST → UTC
+                return Time(dt_utc)
+
+    #default if its not in timestamp.txt
+    dt_est = datetime.strptime(default_time, "%Y-%m-%d %H:%M:%S")
+    dt_utc = dt_est + timedelta(hours=4)
+    return Time(dt_utc)
 
 def plot_data(img, star_data, save_path="out/stars_identified.jpg"):
 
@@ -300,6 +322,7 @@ def residual_quaternion(params, img_pts, star_pts, camera_matrix):
     quat = params[:4]
     lat, lon = params[4:]
 
+
     t = lla_to_ecef(lat, lon)
     cam_2_world = quaternion_to_transformation_matrix(quat, t)
 
@@ -315,7 +338,7 @@ def residual_quaternion(params, img_pts, star_pts, camera_matrix):
     mean_error = np.mean(errors)
 
     # mean_error, _ = compute_reprojection_error(star_pts, img_pts, rvec, t, camera_matrix)
-    print(f"Current Lat: {np.degrees(lat)}, Lon: {np.degrees(lon)}, Residual: {mean_error}")
+    # print(f"Current Lat: {np.degrees(lat)}, Lon: {np.degrees(lon)}, Residual: {mean_error}")
 
     return errors
 
@@ -349,7 +372,7 @@ def residual_quaternion_t(params, quat, img_pts, star_pts, camera_matrix):
     mean_error = np.mean(errors)
 
     # mean_error, _ = compute_reprojection_error(star_pts, img_pts, rvec, t, camera_matrix)
-    print(f"Current Lat: {np.degrees(lat)}, Lon: {np.degrees(lon)}, Residual: {mean_error}")
+    # print(f"Current Lat: {np.degrees(lat)}, Lon: {np.degrees(lon)}, Residual: {mean_error}")
 
     return errors
 
@@ -397,15 +420,19 @@ def solve_least_squares(object_points, image_points, camera_matrix, dist_coeffs=
     return optimized_quat, optimized_t
 
 
-
 def main():
 
     image_name = "enhanced_iphone" #INPUT IMAGE NAME
     fits_dir = "fits_files"
-    
+    txt_path = os.path.join(fits_dir, "timestamp.txt")
+
     star_data = load_star_data(image_name, fits_dir)
 
-    stars_metric = celestial_to_ecef(star_data)
+    image_filename = f"{image_name}.jpg"
+    obs_time = get_image_timestamp(txt_path, image_filename)
+    
+    stars_metric = celestial_to_ecef(star_data, time_str=obs_time.isot)
+    # stars_metric = celestial_to_ecef(star_data)
 
     # x, y, z = celestial_to_cartesian(star_data[:, 2], star_data[:, 3], star_data[:, 4])
     # x, y, z = celestial_to_cartesian(ra_adjusted, dec_adjusted, star_data[:, 4])
@@ -440,7 +467,7 @@ def main():
 
     pc = np.vstack((x_norm, y_norm, z_norm)).T
     pc_adj = stars_metric_norm
-    print(pc.shape)
+    # print(pc.shape)
 
     # Create Open3D point cloud
     pcd = o3d.geometry.PointCloud()

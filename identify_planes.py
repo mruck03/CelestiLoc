@@ -20,10 +20,9 @@ def filter_contrail_contours(contours, min_length=100, min_aspect_ratio=5):
 
 def identify_planes(image):
     if daytime:
-        print('shape', np.shape(image))
         # identify using the contrail
         image_blurred = cv2.GaussianBlur(image, (3,3), 0)
-        edges = cv2.Canny(image_blurred, 10, 200)
+        edges = cv2.Canny(image_blurred, 5, 80)
         contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         contrail_contours = filter_contrail_contours(contours)
         cv2.drawContours(image, contrail_contours, -1, (0, 255, 0), 2)
@@ -60,15 +59,15 @@ def identify_planes(image):
 
 if __name__ == "__main__":
     # image_path = "contrails/plane2.jpg"
-    image_path = "contrails/2025-03-19T173627361Z.jpeg"
+    image_path = "filtered_images/cluster_24/2025-04-03T162544933Z.jpeg"
     # image_path = "contrails/2025-03-19T163904410Z.jpeg"
     # image_path = "contrails/2025-03-19T164523643Z.jpeg"
     image = cv2.imread(image_path)
     # crop out the timestamp
-    image = image[50:, :]
+    image = image[60:, :]
 
     edges, contrail_ends = identify_planes(image)
-    # cv2.imshow("Edges", edges)
+    cv2.imshow("Edges", edges)
 
     for end in contrail_ends:
         cv2.circle(image, end, 5, (0, 0, 255), -1)

@@ -7,6 +7,12 @@ import astropy.units as u
 from astropy.coordinates import SkyCoord
 from tqdm import tqdm
 import open3d as o3d
+from image_filter import K
+from scipy.spatial.transform import Rotation as R
+from scipy.optimize import least_squares, minimize
+from astropy.time import Time
+from datetime import datetime, timezone, timedelta
+
 
 def read_rdls_file(file_path):
     hdul = fits.open(file_path)
@@ -31,6 +37,82 @@ def read_xyls_file(file_path):
     hdul.close()
 
     return x_pixels, y_pixels
+
+def load_star_data(image_name, fits_dir):
+
+    rdls_file = "{}.rdls".format(image_name)
+    rdls_path = os.path.join(fits_dir, rdls_file)
+    xyls_file = "{}-indx.xyls".format(image_name)
+    xyls_path = os.path.join(fits_dir, xyls_file)
+    image_file = "{}.jpg".format(image_name)
+    image_path = os.path.join(fits_dir, image_file)
+
+    # Read in Image
+    img = cv2.imread(image_path)
+
+    if os.path.exists(f"out/{image_name}_star_data.csv"):
+        # Load the data from the CSV file
+        star_data = np.loadtxt(f"out/{image_name}_star_data.csv", delimiter=',')
+    else:
+
+        # Extract RA and Dec
+        ra, dec = read_rdls_file(rdls_path)
+        # print(ra)
+        # print(dec)
+
+        #Read pixels
+        x_pixels, y_pixels = read_xyls_file(xyls_path)
+
+        #Create Numpy array of star data
+        # (x, y, ra, dec)
+        ra_np = np.array(ra)
+        dec_np = np.array(dec)
+        x_pixels_np = np.array(x_pixels)
+        y_pixels_np = np.array(y_pixels)
+
+        star_data = np.vstack((x_pixels_np, y_pixels_np, ra_np, dec_np)).T
+        
+        #Plot data using opencv
+        plot_data(img, star_data, f"out/{image_name}_stars_identified.jpg")
+
+        #Get Star Distances:
+        print("Processing stars for Distances")
+        dists = np.array(get_star_distance(star_data))
+        # dists = np.ones((1, star_data.shape[0]))*100000000000000000
+
+        #Star data: (x, y, ra, dec, dist (m))
+        star_data = np.vstack((star_data.T, dists)).T
+        star_data = star_data[star_data[:, 4] != None]
+        # star_data[:, 4] /= star_data[:, 4].max()
+        # star_data[:, 4] *= 1000
+
+        # print(star_data.shape)
+        star_data = star_data.astype(float)
+
+        np.savetxt(f"out/{image_name}_star_data.csv", star_data, delimiter=',', fmt='%.6f')
+
+    return star_data
+
+def get_image_timestamp(txt_path, image_filename, default_time="2025-04-01 04:00:00"):
+    with open(txt_path, "r") as f:
+        lines = f.readlines()
+
+    print(lines)
+    for line in lines:
+        parts = line.strip().split(",")
+        if len(parts) >= 2:
+            name = parts[0].strip()
+            ts = parts[1].strip()
+            print(name, image_filename)
+            if name == image_filename:
+                dt_est = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+                dt_utc = dt_est + timedelta(hours=4)  #EST → UTC
+                return Time(dt_utc)
+
+    #default if its not in timestamp.txt
+    dt_est = datetime.strptime(default_time, "%Y-%m-%d %H:%M:%S")
+    dt_utc = dt_est + timedelta(hours=4)
+    return Time(dt_utc)
 
 def plot_data(img, star_data, save_path="out/stars_identified.jpg"):
 
@@ -94,12 +176,34 @@ def get_star_distance(star_data):
 
     return dists
 
+
 def celestial_to_cartesian(ra, dec, dist):
     x = dist * np.cos(np.deg2rad(dec)) * np.cos(np.deg2rad(ra))
     y = dist * np.cos(np.deg2rad(dec)) * np.sin(np.deg2rad(ra))
     z = dist * np.sin(np.deg2rad(dec))
-
     return x, y, z
+
+def celestial_to_ecef(star_data, time_str="2025-04-01T04:00:00"):
+
+    obs_time = Time(time_str)
+
+    gst = obs_time.sidereal_time('mean', longitude=0)  # GST in hours
+    gst_rad = gst.to(u.rad)
+
+    rotation_matrix = np.array([
+        [np.cos(gst_rad), np.sin(gst_rad), 0],
+        [-np.sin(gst_rad), np.cos(gst_rad), 0],
+        [0, 0, 1]
+    ])
+
+    x, y, z = celestial_to_cartesian(star_data[:, 2], star_data[:, 3], star_data[:, 4])
+
+    star_coords = np.vstack((x, y, z))
+
+    star_coords_adj = rotation_matrix @ star_coords
+
+    return star_coords_adj.T
+
 def plot_3d_pose(star_data, scale=1):
     x, y, z = celestial_to_cartesian(star_data[:, 2], star_data[:, 3], star_data[:, 4])
 
@@ -120,58 +224,268 @@ def plot_3d_pose(star_data, scale=1):
     # Visualize
     o3d.visualization.draw_geometries([pcd, axis])
 
+def solve_pnp(object_points, image_points, camera_matrix, dist_coeffs=None, method=cv2.SOLVEPNP_ITERATIVE):
+    """
+    Solves the Perspective-n-Point (PnP) problem to estimate camera pose.
+
+    Parameters:
+    - object_points: (Nx3 array) 3D points in the world frame.
+    - image_points: (Nx2 array) 2D points in the image frame.
+    - camera_matrix: (3x3 array) Camera intrinsic matrix.
+    - dist_coeffs: (optional, default=None) Distortion coefficients (set to None if no distortion).
+    - method: (default=cv2.SOLVEPNP_ITERATIVE) Method for solving PnP (e.g., cv2.SOLVEPNP_EPNP, cv2.SOLVEPNP_ITERATIVE, cv2.SOLVEPNP_AP3P).
+
+    Returns:
+    - success: Boolean indicating if solving was successful.
+    - rvec: (3x1 array) Rotation vector.
+    - tvec: (3x1 array) Translation vector.
+    """
+    object_points = np.array(object_points, dtype=np.float32)
+    image_points = np.array(image_points, dtype=np.float32)
+
+    print(object_points.shape)
+    
+    if dist_coeffs is None:
+        dist_coeffs = np.zeros((4,1))  # Assuming no distortion if not provided
+    
+    success, rvec, tvec, _ = cv2.solvePnPRansac(object_points, image_points, camera_matrix, dist_coeffs)
+    # success, rvec, tvec, inliers = cv2.solvePnPRansac(
+    # object_points, image_points, camera_matrix, dist_coeffs, 
+    # rvec=None, tvec=None, useExtrinsicGuess=False, iterationsCount=100, 
+    # reprojectionError=8.0, confidence=0.99, flags=method
+    # )
+    
+    return success, rvec, tvec
+
+def quaternion_to_transformation_matrix(quaternion, translation):
+    """
+    Converts a quaternion and a translation vector into a 4x4 transformation matrix.
+    
+    Args:
+        quaternion: (w, x, y, z) tuple or list
+        translation: (tx, ty, tz) tuple or list
+    
+    Returns:
+        4x4 NumPy array representing the transformation matrix.
+    """
+    # Convert quaternion to rotation matrix
+    r = R.from_quat(quaternion)  # SciPy uses (x, y, z, w)
+    R_matrix = r.as_matrix()  # 3x3 rotation matrix
+    
+    # Construct 4x4 transformation matrix
+    T = np.eye(4)
+    T[:3, :3] = R_matrix
+    T[:3, 3] = translation
+    
+    return T
+
+def lla_to_ecef(lat, lon, alt_m=0.0):
+    """
+    Convert latitude, longitude, and altitude to ECEF (Earth-Centered, Earth-Fixed) coordinates.
+    
+    Parameters:
+        lat (float): Latitude in radians
+        lon (float): Longitude in radians
+        alt_m (float): Altitude in meters (default is 0 for sea level)
+        
+    Returns:
+        x, y, z (float): ECEF coordinates in meters
+    """
+    # WGS84 ellipsoid constants
+    a = 6378137.0          # Equatorial radius in meters
+    f = 1 / 298.257223563  # Flattening
+    e2 = f * (2 - f)       # Square of eccentricity
+
+    lon = ((lon + np.pi) % (2*np.pi)) - np.pi
+
+    N = a / np.sqrt(1 - e2 * np.sin(lat)**2)  # Radius of curvature
+
+    x = (N + alt_m) * np.cos(lat) * np.cos(lon)
+    y = (N + alt_m) * np.cos(lat) * np.sin(lon)
+    z = ((1 - e2) * N + alt_m) * np.sin(lat)
+
+    return np.array([x, y, z])
+
+def residual_quaternion(params, img_pts, star_pts, camera_matrix):
+    """
+    Computes the residuals between transformed points in frame A and points in frame B using a quaternion.
+
+    Args:
+        params (np.ndarray): Optimization parameters (first 4 values are quaternion, last 3 are translation).
+        img_pts (np.ndarray): Array of shape (N, 2) representing indexes of image
+        points_b (np.ndarray): Array of shape (N, 3) representing points of stars in world frame
+
+    Returns:
+        np.ndarray: Residuals (differences) between transformed points_a and points_b.
+    """
+    # Extract quaternion and translation parameters
+    quat = params[:4]
+    lat, lon = params[4:]
+
+
+    t = lla_to_ecef(lat, lon)
+    cam_2_world = quaternion_to_transformation_matrix(quat, t)
+
+    world_2_cam = np.linalg.inv(cam_2_world)
+
+    star_pts_homo = np.vstack((star_pts.T, np.ones(star_pts.shape[0])))
+    proj_points = camera_matrix @ world_2_cam[:3, :] @ star_pts_homo
+    proj_points = (proj_points[:2, :] / proj_points[2, :]).T
+
+    errors = np.linalg.norm(img_pts - proj_points, axis=1)
+
+    # Compute the mean error
+    mean_error = np.mean(errors)
+
+    # mean_error, _ = compute_reprojection_error(star_pts, img_pts, rvec, t, camera_matrix)
+    # print(f"Current Lat: {np.degrees(lat)}, Lon: {np.degrees(lon)}, Residual: {mean_error}")
+
+    return errors
+
+def residual_quaternion_t(params, quat, img_pts, star_pts, camera_matrix):
+    """
+    Computes the residuals between transformed points in frame A and points in frame B using a quaternion.
+
+    Args:
+        params (np.ndarray): Optimization parameters (first 4 values are quaternion, last 3 are translation).
+        img_pts (np.ndarray): Array of shape (N, 2) representing indexes of image
+        points_b (np.ndarray): Array of shape (N, 3) representing points of stars in world frame
+
+    Returns:
+        np.ndarray: Residuals (differences) between transformed points_a and points_b.
+    """
+    # Extract quaternion and translation parameters
+    lat, lon = params
+
+    t = lla_to_ecef(lat, lon)
+    cam_2_world = quaternion_to_transformation_matrix(quat, t)
+
+    world_2_cam = np.linalg.inv(cam_2_world)
+
+    star_pts_homo = np.vstack((star_pts.T, np.ones(star_pts.shape[0])))
+    proj_points = camera_matrix @ world_2_cam[:3, :] @ star_pts_homo
+    proj_points = (proj_points[:2, :] / proj_points[2, :]).T
+
+    errors = np.linalg.norm(img_pts - proj_points, axis=1)
+
+    # Compute the mean error
+    mean_error = np.mean(errors)
+
+    # mean_error, _ = compute_reprojection_error(star_pts, img_pts, rvec, t, camera_matrix)
+    # print(f"Current Lat: {np.degrees(lat)}, Lon: {np.degrees(lon)}, Residual: {mean_error}")
+
+    return errors
+
+
+def solve_least_squares(object_points, image_points, camera_matrix, dist_coeffs=None):
+
+    initial_quat = np.array([0.0, 0.0, 0.0, 1.0]) 
+    initial_translation = np.deg2rad(np.array([42.0, -83.0])) # (latitude, longitude)
+    initial_params = np.hstack((initial_quat, initial_translation))
+
+    # Define bounds for quaternion and translation parameters
+    quat_bounds = (-1, 1)  # Example bounds for quaternion values (to keep normalized)
+    translation_bounds = ([-np.pi/2, -np.inf], [np.pi/2, np.inf])  # Set bounds for translation (adjust as needed)
+
+    # Combine bounds for all parameters
+    lower_bounds = np.hstack((np.full(4, quat_bounds[0]), translation_bounds[0]))
+    upper_bounds = np.hstack((np.full(4, quat_bounds[1]), translation_bounds[1]))
+    bounds = list(zip(lower_bounds, upper_bounds))
+
+    options = {
+        # 'xatol': 1e-10,  # Absolute tolerance on parameters (small values make parameters change less)
+        # 'fatol': 1e-100,   # Absolute tolerance on objective function value
+        'maxiter': 1000,  # Maximum number of iterations
+        'disp': True,      # Display optimization process
+        # 'line_search':'strong_wolfe'
+    }
+
+    # result = minimize(
+    #     lambda x: residual_quaternion(x, image_points, object_points, camera_matrix),
+    #     initial_params,
+    #     options = options,
+    #     bounds=bounds,
+    #     method= "L-BFGS-B" #"BFGS"#'Nelder-Mead'#"L-BFGS-B" # or 'TNC', 'SLSQP', etc., #TODO: Mess around with these to see which is best
+    # )
+    print("Optimizing for Both")
+    result = least_squares(residual_quaternion, initial_params, args=(image_points, object_points, camera_matrix), bounds=(lower_bounds, upper_bounds), method="dogbox")
+    optimized_quat = result.x[:4]
+    optimized_t = result.x[4:]
+
+    print("Optimization for Lat/Lon")
+    result = least_squares(residual_quaternion_t, optimized_t, args=(optimized_quat, image_points, object_points, camera_matrix), bounds=(translation_bounds[0], translation_bounds[1]), method="dogbox", diff_step=1e-4)
+
+    #TODO: Maybe optimize rotation and then translation????
+
+    return optimized_quat, optimized_t
+
 
 def main():
 
-    image_name = "test2" #INPUT IMAGE NAME
-
-    # Open the .rdls file
+    image_name = "enhanced_iphone" #INPUT IMAGE NAME
     fits_dir = "fits_files"
-    rdls_file = "{}.rdls".format(image_name)
-    rdls_path = os.path.join(fits_dir, rdls_file)
-    xyls_file = "{}-indx.xyls".format(image_name)
-    xyls_path = os.path.join(fits_dir, xyls_file)
-    image_file = "{}.jpg".format(image_name)
-    image_path = os.path.join(fits_dir, image_file)
+    txt_path = os.path.join(fits_dir, "timestamp.txt")
 
-    # Read in Image
-    img = cv2.imread(image_path)
+    star_data = load_star_data(image_name, fits_dir)
 
-    # Extract RA and Dec
-    ra, dec = read_rdls_file(rdls_path)
-    # print(ra)
-    # print(dec)
-
-    #Read pixels
-    x_pixels, y_pixels = read_xyls_file(xyls_path)
-
-    #Create Numpy array of star data
-    # (x, y, ra, dec)
-    ra_np = np.array(ra)
-    dec_np = np.array(dec)
-    x_pixels_np = np.array(x_pixels)
-    y_pixels_np = np.array(y_pixels)
-
-    star_data = np.vstack((x_pixels_np, y_pixels_np, ra_np, dec_np)).T
+    image_filename = f"{image_name}.jpg"
+    obs_time = get_image_timestamp(txt_path, image_filename)
     
-    #Plot data using opencv
-    plot_data(img, star_data)
+    stars_metric = celestial_to_ecef(star_data, time_str=obs_time.isot)
+    # stars_metric = celestial_to_ecef(star_data)
 
-    #Get Star Distances:
-    print("Processing stars for Distances")
-    dists = get_star_distance(star_data)
+    # x, y, z = celestial_to_cartesian(star_data[:, 2], star_data[:, 3], star_data[:, 4])
+    # x, y, z = celestial_to_cartesian(ra_adjusted, dec_adjusted, star_data[:, 4])
+    # success, rvec, t = solve_pnp(np.vstack((x, y, z)).T, star_data[:, :2], K)
 
-    #Star data: (x, y, ra, dec, dist (m))
-    star_data = np.vstack((star_data.T, np.array(dists))).T
-    star_data = star_data[star_data[:, 4] != None]
+    # quat, pos = solve_least_squares(np.vstack((x, y, z)).T, star_data[:, :2], K)
+    quat, pos = solve_least_squares(stars_metric, star_data[:, :2], K)
+    t = lla_to_ecef(pos[0], pos[1])
 
-    print(star_data.shape)
-    star_data = star_data.astype(float)
+    print(f"Rotation Vector: {quat}")
+    print(f"(Lat, Lon): {np.degrees(pos)}")
 
-    plot_3d_pose(star_data)
+    T = quaternion_to_transformation_matrix(quat, t/np.linalg.norm(t))
+
+    print("Transformation Matrix")
+    print(T)
+
+    #Vizualize
+    frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.7)
+    frame.transform(T)
+
+    axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.5, origin=[0, 0, 0])
+
+    # Visualize the transformed coordinate frame
+    star_dist_norm = star_data[:, 4] / star_data[:, 4].max()
+    star_dist_norm += 10
+
+    x_norm, y_norm, z_norm = celestial_to_cartesian(star_data[:, 2], star_data[:, 3], star_dist_norm)
+    star_data[:, 4] = star_dist_norm
+    stars_metric_norm = celestial_to_ecef(star_data)
+
+
+    pc = np.vstack((x_norm, y_norm, z_norm)).T
+    pc_adj = stars_metric_norm
+    # print(pc.shape)
+
+    # Create Open3D point cloud
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(pc)
+    pcd.colors = o3d.utility.Vector3dVector(np.ones((len(pc), 3)) * [1, 0, 0])
+
+    pcd_adj = o3d.geometry.PointCloud()
+    pcd_adj.points = o3d.utility.Vector3dVector(pc_adj)
+    pcd_adj.colors = o3d.utility.Vector3dVector(np.ones((len(pc_adj), 3)) * [0, 0, 1])
+
+    earth = o3d.geometry.TriangleMesh.create_sphere(radius=1.0, resolution=20)
+    
+
+    # Create coordinate frame (origin)
+    o3d.visualization.draw_geometries([frame, axis, pcd, pcd_adj, earth])
 
 
 if __name__ == "__main__":
     Gaia.TIMEOUT = 120  # Increase timeout to 2 minutes
-    Gaia.login(user="mrucker", password="Rob3dpass_")
+    # Gaia.login(user="mrucker", password="Rob3dpass_")
     main()

@@ -40,19 +40,19 @@ def read_xyls_file(file_path):
 
 def load_star_data(image_name, fits_dir):
 
-    rdls_file = "{}.rdls".format(image_name)
-    rdls_path = os.path.join(fits_dir, rdls_file)
-    xyls_file = "{}-indx.xyls".format(image_name)
-    xyls_path = os.path.join(fits_dir, xyls_file)
-    image_file = "{}.jpg".format(image_name)
-    image_path = os.path.join(fits_dir, image_file)
+    rdls_file = "{}_enhanced.rdls".format(image_name)
+    rdls_path = os.path.join(fits_dir, image_name, rdls_file)
+    xyls_file = "{}_enhanced-indx.xyls".format(image_name)
+    xyls_path = os.path.join(fits_dir, image_name, xyls_file)
+    image_file = "{}_enhanced.jpg".format(image_name)
+    image_path = os.path.join(fits_dir, image_name,image_file)
 
     # Read in Image
     img = cv2.imread(image_path)
 
-    if os.path.exists(f"out/{image_name}_star_data.csv"):
+    if os.path.exists(f"{fits_dir}/{image_name}/{image_name}_star_data.csv"):
         # Load the data from the CSV file
-        star_data = np.loadtxt(f"out/{image_name}_star_data.csv", delimiter=',')
+        star_data = np.loadtxt(f"{fits_dir}/{image_name}/{image_name}_star_data.csv", delimiter=',')
     else:
 
         # Extract RA and Dec
@@ -73,7 +73,7 @@ def load_star_data(image_name, fits_dir):
         star_data = np.vstack((x_pixels_np, y_pixels_np, ra_np, dec_np)).T
         
         #Plot data using opencv
-        plot_data(img, star_data, f"out/{image_name}_stars_identified.jpg")
+        plot_data(img, star_data, f"{fits_dir}/{image_name}/{image_name}_stars_identified.jpg")
 
         #Get Star Distances:
         print("Processing stars for Distances")
@@ -89,7 +89,7 @@ def load_star_data(image_name, fits_dir):
         # print(star_data.shape)
         star_data = star_data.astype(float)
 
-        np.savetxt(f"out/{image_name}_star_data.csv", star_data, delimiter=',', fmt='%.6f')
+        np.savetxt(f"{fits_dir}/{image_name}/{image_name}_star_data.csv", star_data, delimiter=',', fmt='%.6f')
 
     return star_data
 
@@ -105,13 +105,12 @@ def get_image_timestamp(txt_path, image_filename, default_time="2025-04-01 04:00
             ts = parts[1].strip()
             print(name, image_filename)
             if name == image_filename:
-                dt_est = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
-                dt_utc = dt_est + timedelta(hours=4)  #EST → UTC
+                dt_utc = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+                # dt_utc = dt_est + timedelta(hours=4)  #EST → UTC
                 return Time(dt_utc)
 
     #default if its not in timestamp.txt
-    dt_est = datetime.strptime(default_time, "%Y-%m-%d %H:%M:%S")
-    dt_utc = dt_est + timedelta(hours=4)
+    dt_utc = datetime.strptime(default_time, "%Y-%m-%d %H:%M:%S")
     return Time(dt_utc)
 
 def plot_data(img, star_data, save_path="out/stars_identified.jpg"):
@@ -320,6 +319,7 @@ def residual_quaternion(params, img_pts, star_pts, camera_matrix):
     """
     # Extract quaternion and translation parameters
     quat = params[:4]
+    quat = quat / np.linalg.norm(quat)
     lat, lon = params[4:]
 
 
@@ -338,9 +338,106 @@ def residual_quaternion(params, img_pts, star_pts, camera_matrix):
     mean_error = np.mean(errors)
 
     # mean_error, _ = compute_reprojection_error(star_pts, img_pts, rvec, t, camera_matrix)
-    # print(f"Current Lat: {np.degrees(lat)}, Lon: {np.degrees(lon)}, Residual: {mean_error}")
+    print(f"Current Lat: {np.degrees(lat)}, Lon: {np.degrees(lon)}, Residual: {mean_error}")
 
     return errors
+
+def residual_quaternion_R(params, opt_t ,img_pts, star_pts, camera_matrix):
+    """
+    Computes the residuals between transformed points in frame A and points in frame B using a quaternion.
+
+    Args:
+        params (np.ndarray): Optimization parameters (first 4 values are quaternion, last 3 are translation).
+        img_pts (np.ndarray): Array of shape (N, 2) representing indexes of image
+        star_pts (np.ndarray): Array of shape (N, 3) representing points of stars in world frame
+
+    Returns:
+        np.ndarray: Residuals (differences) between transformed points_a and points_b.
+    """
+    # Extract quaternion and translation parameters
+    quat = params[:4]
+    quat = quat / np.linalg.norm(quat)
+    lat, lon = opt_t
+
+
+    t = lla_to_ecef(lat, lon)
+    cam_2_world = quaternion_to_transformation_matrix(quat, t)
+
+    world_2_cam = np.linalg.inv(cam_2_world)
+
+    star_pts_homo = np.vstack((star_pts.T, np.ones(star_pts.shape[0])))
+    star_pts_cam = world_2_cam[:3, :] @ star_pts_homo
+
+    in_front = star_pts_cam[2, :] > 0
+    if np.sum(in_front) == 0:
+        return 1e9  # Penalize bad poses heavily
+
+    star_pts_cam = star_pts_cam[:, in_front]
+    img_pts_filtered = img_pts[in_front]
+
+    proj_points = camera_matrix @ star_pts_cam[:3, :]
+    proj_points = (proj_points[:2, :] / proj_points[2, :]).T
+
+    # Compute reprojection errors
+    errors = np.linalg.norm(img_pts_filtered - proj_points, axis=1)
+
+    # Compute the mean error
+    sum_error = np.sum(errors)
+
+    missing_penalty = 100000 * (star_pts.shape[0] - np.sum(in_front))
+    # print(sum_error + missing_penalty)
+
+    return sum_error + missing_penalty
+
+# def residual_quaternion_t(params, quat, img_pts, star_pts, camera_matrix):
+#     """
+#       OLD DOES NOT WORK!!!!!
+#     Computes the residuals between transformed points in frame A and points in frame B using a quaternion.
+
+#     Args:
+#         params (np.ndarray): Optimization parameters (first 4 values are quaternion, last 3 are translation).
+#         img_pts (np.ndarray): Array of shape (N, 2) representing indexes of image
+#         points_b (np.ndarray): Array of shape (N, 3) representing points of stars in world frame
+
+#     Returns:
+#         np.ndarray: Residuals (differences) between transformed points_a and points_b.
+#     """
+#     # Extract quaternion and translation parameters
+#     lat, lon = params
+
+
+#     t = lla_to_ecef(lat, lon)
+#     cam_2_world = quaternion_to_transformation_matrix(quat, t)
+
+#     world_2_cam = np.linalg.inv(cam_2_world)
+
+#     star_pts_homo = np.vstack((star_pts.T, np.ones(star_pts.shape[0])))
+#     star_pts_cam = world_2_cam[:3, :] @ star_pts_homo
+
+#     in_front = star_pts_cam[2, :] > 0
+#     if np.sum(in_front) == 0:
+#         return 1e9  # Penalize bad poses heavily
+
+#     star_pts_cam = star_pts_cam[:, in_front]
+#     img_pts_filtered = img_pts[in_front]
+
+#     proj_points = camera_matrix @ star_pts_cam[:3, :]
+#     proj_points = (proj_points[:2, :] / proj_points[2, :]).T
+
+#     # Compute reprojection errors
+#     errors = np.linalg.norm(img_pts_filtered - proj_points, axis=1)
+
+#     # Compute the mean error
+#     sum_error = np.sum(errors)
+
+#     # mean_error, _ = compute_reprojection_error(star_pts, img_pts, rvec, t, camera_matrix)
+#     # print(f"Current Lat: {np.degrees(lat)}, Lon: {np.degrees(lon)}, Residual: {mean_error}")
+#     missing_penalty = 100000 * (star_pts.shape[0] - np.sum(in_front))
+#     # print(np.sum(in_front))
+#     # print(sum_error + missing_penalty)
+#     print(f"Current Lat: {np.degrees(lat)}, Lon: {np.degrees(lon)}, Residual: {sum_error + missing_penalty}")
+
+#     return (sum_error + missing_penalty)
 
 def residual_quaternion_t(params, quat, img_pts, star_pts, camera_matrix):
     """
@@ -357,25 +454,31 @@ def residual_quaternion_t(params, quat, img_pts, star_pts, camera_matrix):
     # Extract quaternion and translation parameters
     lat, lon = params
 
+
     t = lla_to_ecef(lat, lon)
     cam_2_world = quaternion_to_transformation_matrix(quat, t)
 
     world_2_cam = np.linalg.inv(cam_2_world)
 
     star_pts_homo = np.vstack((star_pts.T, np.ones(star_pts.shape[0])))
-    proj_points = camera_matrix @ world_2_cam[:3, :] @ star_pts_homo
-    proj_points = (proj_points[:2, :] / proj_points[2, :]).T
+    star_pts_cam = world_2_cam[:3, :] @ star_pts_homo
 
-    errors = np.linalg.norm(img_pts - proj_points, axis=1)
+    # Get normalized vectors from camera to world star points
+    star_rays_cam = star_pts_cam.T / np.linalg.norm(star_pts_cam.T, axis=1, keepdims=True)
 
-    # Compute the mean error
-    mean_error = np.mean(errors)
+    # Back-project image points into camera rays
+    img_pts_homo = np.vstack((img_pts.T, np.ones(img_pts.shape[0])))
+    img_pts_3D = np.linalg.inv(camera_matrix) @ img_pts_homo
 
-    # mean_error, _ = compute_reprojection_error(star_pts, img_pts, rvec, t, camera_matrix)
-    # print(f"Current Lat: {np.degrees(lat)}, Lon: {np.degrees(lon)}, Residual: {mean_error}")
+    img_rays = img_pts_3D.T / np.linalg.norm(img_pts_3D.T, axis=1, keepdims=True)
 
-    return errors
+    # Compute angle between rays and star vectors
+    dot_products = np.sum(star_rays_cam * img_rays, axis=1)
+    angles = np.arccos(np.clip(dot_products, -1.0, 1.0))
 
+    print(f"Current Lat: {np.degrees(lat)}, Lon: {np.degrees(lon)}, Residual: {np.sum(angles**2)}")
+
+    return np.sum(angles**2)# or np.mean(angles) if needed
 
 def solve_least_squares(object_points, image_points, camera_matrix, dist_coeffs=None):
 
@@ -407,13 +510,27 @@ def solve_least_squares(object_points, image_points, camera_matrix, dist_coeffs=
     #     bounds=bounds,
     #     method= "L-BFGS-B" #"BFGS"#'Nelder-Mead'#"L-BFGS-B" # or 'TNC', 'SLSQP', etc., #TODO: Mess around with these to see which is best
     # )
-    print("Optimizing for Both")
-    result = least_squares(residual_quaternion, initial_params, args=(image_points, object_points, camera_matrix), bounds=(lower_bounds, upper_bounds), method="dogbox")
-    optimized_quat = result.x[:4]
-    optimized_t = result.x[4:]
+    result = minimize(
+        lambda x: residual_quaternion_R(x, initial_translation, image_points, object_points, camera_matrix),
+        initial_quat,
+        options = options,
+        bounds=list(zip(np.full(4, quat_bounds[0]), np.full(4, quat_bounds[1]))),
+        method= "L-BFGS-B" #"BFGS"#'Nelder-Mead'#"L-BFGS-B" # or 'TNC', 'SLSQP', etc., #TODO: Mess around with these to see which is best
+    )
+    print("Optimizing for R")
+    # result = least_squares(residual_quaternion_R, initial_quat, args=(initial_translation, image_points, object_points, camera_matrix), bounds=(np.full(4, quat_bounds[0]), np.full(4, quat_bounds[1])), method="dogbox")
+    optimized_quat = result.x / np.linalg.norm(result.x)
 
     print("Optimization for Lat/Lon")
-    result = least_squares(residual_quaternion_t, optimized_t, args=(optimized_quat, image_points, object_points, camera_matrix), bounds=(translation_bounds[0], translation_bounds[1]), method="dogbox", diff_step=1e-4)
+    result = minimize(
+        lambda x: residual_quaternion_t(x, optimized_quat, image_points, object_points, camera_matrix),
+        initial_translation,
+        options = options,
+        bounds=list(zip(translation_bounds[0], translation_bounds[1])),
+        method= "Nelder-Mead" #"BFGS"#'Nelder-Mead'#"L-BFGS-B" # or 'TNC', 'SLSQP', etc., #TODO: Mess around with these to see which is best
+    )
+    # result = least_squares(residual_quaternion_t, initial_translation, args=(optimized_quat, image_points, object_points, camera_matrix), bounds=(translation_bounds[0], translation_bounds[1]), method="dogbox")
+    optimized_t = result.x
 
     #TODO: Maybe optimize rotation and then translation????
 
@@ -422,14 +539,15 @@ def solve_least_squares(object_points, image_points, camera_matrix, dist_coeffs=
 
 def main():
 
-    image_name = "enhanced_iphone" #INPUT IMAGE NAME
+    image_name = "2025-04-01T100253631Z" #INPUT IMAGE NAME
+    # image_name = "enhanced_iphone" #INPUT IMAGE NAME
     fits_dir = "fits_files"
     txt_path = os.path.join(fits_dir, "timestamp.txt")
 
     star_data = load_star_data(image_name, fits_dir)
 
-    image_filename = f"{image_name}.jpg"
-    obs_time = get_image_timestamp(txt_path, image_filename)
+    obs_time = get_image_timestamp(txt_path, image_name)
+    print(obs_time.isot)
     
     stars_metric = celestial_to_ecef(star_data, time_str=obs_time.isot)
     # stars_metric = celestial_to_ecef(star_data)
@@ -462,7 +580,7 @@ def main():
 
     x_norm, y_norm, z_norm = celestial_to_cartesian(star_data[:, 2], star_data[:, 3], star_dist_norm)
     star_data[:, 4] = star_dist_norm
-    stars_metric_norm = celestial_to_ecef(star_data)
+    stars_metric_norm = celestial_to_ecef(star_data, obs_time.isot)
 
 
     pc = np.vstack((x_norm, y_norm, z_norm)).T

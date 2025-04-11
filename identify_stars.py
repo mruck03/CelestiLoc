@@ -322,25 +322,50 @@ def residual_quaternion(params, img_pts, star_pts, camera_matrix):
     quat = quat / np.linalg.norm(quat)
     lat, lon = params[4:]
 
-
     t = lla_to_ecef(lat, lon)
     cam_2_world = quaternion_to_transformation_matrix(quat, t)
 
     world_2_cam = np.linalg.inv(cam_2_world)
 
     star_pts_homo = np.vstack((star_pts.T, np.ones(star_pts.shape[0])))
-    proj_points = camera_matrix @ world_2_cam[:3, :] @ star_pts_homo
+    star_pts_cam = world_2_cam[:3, :] @ star_pts_homo
+
+    in_front = star_pts_cam[2, :] > 0
+    if np.sum(in_front) == 0:
+        return 1e9  # Penalize bad poses heavily
+
+    star_pts_cam = star_pts_cam[:, in_front]
+    img_pts_filtered = img_pts[in_front]
+
+    proj_points = camera_matrix @ star_pts_cam[:3, :]
     proj_points = (proj_points[:2, :] / proj_points[2, :]).T
 
-    errors = np.linalg.norm(img_pts - proj_points, axis=1)
+    # Compute reprojection errors
+    errors = np.linalg.norm(img_pts_filtered - proj_points, axis=1)
 
     # Compute the mean error
-    mean_error = np.mean(errors)
+    sum_error = np.sum(errors)
 
-    # mean_error, _ = compute_reprojection_error(star_pts, img_pts, rvec, t, camera_matrix)
-    print(f"Current Lat: {np.degrees(lat)}, Lon: {np.degrees(lon)}, Residual: {mean_error}")
+    missing_penalty = 100000 * (star_pts.shape[0] - np.sum(in_front))
+    # print(sum_error + missing_penalty)
 
-    return errors
+    # Get normalized vectors from camera to world star points
+    star_rays_cam = star_pts_cam.T / np.linalg.norm(star_pts_cam.T, axis=1, keepdims=True)
+
+    # Back-project image points into camera rays
+    img_pts_homo = np.vstack((img_pts_filtered.T, np.ones(img_pts_filtered.shape[0])))
+    img_pts_3D = np.linalg.inv(camera_matrix) @ img_pts_homo
+
+    img_rays = img_pts_3D.T / np.linalg.norm(img_pts_3D.T, axis=1, keepdims=True)
+
+    # Compute angle between rays and star vectors
+    dot_products = np.sum(star_rays_cam * img_rays, axis=1)
+    angles = np.arccos(np.clip(dot_products, -1.0, 1.0))
+
+    print(f"Current Lat: {np.degrees(lat)}, Lon: {np.degrees(lon)}, Residual: {np.sum(angles**2) + sum_error + missing_penalty}")
+
+    return np.sum(angles**2) + sum_error + missing_penalty
+    
 
 def residual_quaternion_R(params, opt_t ,img_pts, star_pts, camera_matrix):
     """
@@ -503,6 +528,7 @@ def solve_least_squares(object_points, image_points, camera_matrix, dist_coeffs=
         # 'line_search':'strong_wolfe'
     }
 
+    # Optimizing both params at the same time
     # result = minimize(
     #     lambda x: residual_quaternion(x, image_points, object_points, camera_matrix),
     #     initial_params,
@@ -510,6 +536,10 @@ def solve_least_squares(object_points, image_points, camera_matrix, dist_coeffs=
     #     bounds=bounds,
     #     method= "L-BFGS-B" #"BFGS"#'Nelder-Mead'#"L-BFGS-B" # or 'TNC', 'SLSQP', etc., #TODO: Mess around with these to see which is best
     # )
+    # optimized_quat = result.x[:4] / np.linalg.norm(result.x[:4])
+    # optimized_t = result.x[4:]
+    
+    # print("Optimizing for R")
     result = minimize(
         lambda x: residual_quaternion_R(x, initial_translation, image_points, object_points, camera_matrix),
         initial_quat,
@@ -517,7 +547,6 @@ def solve_least_squares(object_points, image_points, camera_matrix, dist_coeffs=
         bounds=list(zip(np.full(4, quat_bounds[0]), np.full(4, quat_bounds[1]))),
         method= "L-BFGS-B" #"BFGS"#'Nelder-Mead'#"L-BFGS-B" # or 'TNC', 'SLSQP', etc., #TODO: Mess around with these to see which is best
     )
-    print("Optimizing for R")
     # result = least_squares(residual_quaternion_R, initial_quat, args=(initial_translation, image_points, object_points, camera_matrix), bounds=(np.full(4, quat_bounds[0]), np.full(4, quat_bounds[1])), method="dogbox")
     optimized_quat = result.x / np.linalg.norm(result.x)
 
@@ -539,7 +568,7 @@ def solve_least_squares(object_points, image_points, camera_matrix, dist_coeffs=
 
 def main():
 
-    image_name = "2025-04-01T100253631Z" #INPUT IMAGE NAME
+    image_name = "2025-04-07T055924556Z" #INPUT IMAGE NAME
     # image_name = "enhanced_iphone" #INPUT IMAGE NAME
     fits_dir = "fits_files"
     txt_path = os.path.join(fits_dir, "timestamp.txt")

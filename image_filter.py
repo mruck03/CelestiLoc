@@ -43,7 +43,8 @@ def enhance_stars(image):
     enhanced = clahe.apply(blurred)
     
     # Apply thresholding to extract stars
-    _, thresholded = cv2.threshold(enhanced, 120, 255, cv2.THRESH_BINARY)
+    _, thresholded = cv2.threshold(enhanced, 95, 255, cv2.THRESH_BINARY)
+    thresholded[-100:, :] = 0
     
     # Show the processed image
     # cv2.imshow("Original", img)
@@ -58,17 +59,17 @@ def enhance_stars(image):
 if __name__ == "__main__":
     # Example usage
     dir = "fits_files"
-    image_name = "2025-04-01T020253631Z"  # Replace with your image file
-    img_path = os.path.join(os.path.join(dir, image_name), f"{image_name}.jpg")
+    image_name = "2025-04-07T045859245Z"  # Replace with your image file
+    img_path = os.path.join(os.path.join(dir, image_name), f"{image_name}.jpeg")
 
     #Saved an enhanced image
     img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-    # img = cv2.resize(img, (2688, 1512))
+    img = cv2.resize(img, (1920, 1080))
 
 
     undistorted_image = cv2.undistort(img, K, D)
-    # result = enhance_stars(undistorted_image)
-    result = undistorted_image
+    result = enhance_stars(undistorted_image)
+    # result = undistorted_image
     save_path = os.path.join(os.path.join(dir, image_name), f"{image_name}_enhanced.jpg")
 
     # Save the result

@@ -38,6 +38,22 @@ def read_xyls_file(file_path):
 
     return x_pixels, y_pixels
 
+def load_star_data_batch(image_names, fits_dir, txt_path):
+    all_data = []
+
+    for image_name in image_names:
+        star_data = load_star_data(image_name, fits_dir)
+
+        obs_time = get_image_timestamp(txt_path, image_name)
+
+        all_data.append({
+            "star_data": star_data,
+            "obs_time": obs_time,
+        })
+
+    return all_data
+
+
 def load_star_data(image_name, fits_dir):
 
     rdls_file = "{}_enhanced.rdls".format(image_name)
@@ -46,15 +62,15 @@ def load_star_data(image_name, fits_dir):
     xyls_path = os.path.join(fits_dir, image_name, xyls_file)
     image_file = "{}_enhanced.jpg".format(image_name)
     image_path = os.path.join(fits_dir, image_name,image_file)
-
+    saved_files = "out"
+    
     # Read in Image
     img = cv2.imread(image_path)
 
-    if os.path.exists(f"{fits_dir}/{image_name}/{image_name}_star_data.csv"):
+    if os.path.exists(f"{fits_dir}/{saved_files}/{image_name}/{image_name}_star_data.csv"):
         # Load the data from the CSV file
-        star_data = np.loadtxt(f"{fits_dir}/{image_name}/{image_name}_star_data.csv", delimiter=',')
+        star_data = np.loadtxt(f"{fits_dir}/{saved_files}/{image_name}/{image_name}_star_data.csv", delimiter=',')
     else:
-
         # Extract RA and Dec
         ra, dec = read_rdls_file(rdls_path)
         # print(ra)
@@ -567,30 +583,34 @@ def solve_least_squares(object_points, image_points, camera_matrix, dist_coeffs=
 
 
 def main():
-
-    image_name = "2025-04-07T055924556Z" #INPUT IMAGE NAME
-    # image_name = "enhanced_iphone" #INPUT IMAGE NAME
+    image_names = ["2025-04-07T055924556Z", "2025-04-01T100253631Z"]
     fits_dir = "fits_files"
     txt_path = os.path.join(fits_dir, "timestamp.txt")
 
-    star_data = load_star_data(image_name, fits_dir)
+    dataset = load_star_data_batch(image_names, fits_dir, txt_path)
 
-    obs_time = get_image_timestamp(txt_path, image_name)
-    print(obs_time.isot)
-    
-    stars_metric = celestial_to_ecef(star_data, time_str=obs_time.isot)
-    # stars_metric = celestial_to_ecef(star_data)
+    all_obj_pts = []
+    all_img_pts = []
 
-    # x, y, z = celestial_to_cartesian(star_data[:, 2], star_data[:, 3], star_data[:, 4])
-    # x, y, z = celestial_to_cartesian(ra_adjusted, dec_adjusted, star_data[:, 4])
-    # success, rvec, t = solve_pnp(np.vstack((x, y, z)).T, star_data[:, :2], K)
+    for entry in dataset:
+        star_data = entry["star_data"]
+        obs_time = entry["obs_time"]
 
-    # quat, pos = solve_least_squares(np.vstack((x, y, z)).T, star_data[:, :2], K)
-    quat, pos = solve_least_squares(stars_metric, star_data[:, :2], K)
+        stars_metric = celestial_to_ecef(star_data, time_str=obs_time.isot)
+
+        all_obj_pts.append(stars_metric)
+        all_img_pts.append(star_data[:, :2])  # x, y
+
+    # Stack all observations from all images
+    object_points = np.vstack(all_obj_pts)
+    image_points = np.vstack(all_img_pts)
+
+    # Solve
+    quat, pos = solve_least_squares(object_points, image_points, K)
     t = lla_to_ecef(pos[0], pos[1])
 
-    print(f"Rotation Vector: {quat}")
-    print(f"(Lat, Lon): {np.degrees(pos)}")
+    print("Estimated Quaternion:", quat)
+    print("Estimated Position (Lat, Lon):", np.degrees(pos))
 
     T = quaternion_to_transformation_matrix(quat, t/np.linalg.norm(t))
 

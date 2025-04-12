@@ -5,12 +5,14 @@ import datetime
 import identify_planes as p
 
 if __name__ == "__main__":
-    image_path = "filtered_images/cluster_24/2025-04-03T162544933Z.jpeg" # first plane
-    cluster_dir = "filtered_images/cluster_24"
-    # image_path = "filtered_images/cluster_24/2025-04-03T162034887Z.jpeg" # first image
+    cluster = 24
+    cluster_name = f"cluster_{cluster}"
+    image_path = f"filtered_images/{cluster_name}/2025-04-03T162544933Z.jpeg" # first plane
+    cluster_dir = f"filtered_images/{cluster_name}"
+    image_path = f"filtered_images/{cluster_name}/2025-04-03T162805008Z.jpeg" # last image
     image = cv2.imread(image_path)
     image = image[60:, :]
-    export_path = "marked_planes/cluster_24"
+    export_path = f"marked_planes/{cluster_name}"
     os.makedirs(export_path, exist_ok=True)
 
     # edges, contrail_ends = p.identify_planes(image)

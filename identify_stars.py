@@ -67,9 +67,9 @@ def load_star_data(image_name, fits_dir):
     # Read in Image
     img = cv2.imread(image_path)
 
-    if os.path.exists(f"{fits_dir}/{saved_files}/{image_name}/{image_name}_star_data.csv"):
+    if os.path.exists(f"{fits_dir}/{image_name}/{image_name}_star_data.csv"):
         # Load the data from the CSV file
-        star_data = np.loadtxt(f"{fits_dir}/{saved_files}/{image_name}/{image_name}_star_data.csv", delimiter=',')
+        star_data = np.loadtxt(f"{fits_dir}/{image_name}/{image_name}_star_data.csv", delimiter=',')
     else:
         # Extract RA and Dec
         ra, dec = read_rdls_file(rdls_path)
@@ -583,7 +583,7 @@ def solve_least_squares(object_points, image_points, camera_matrix, dist_coeffs=
 
 
 def main():
-    image_names = ["2025-04-07T055924556Z", "2025-04-01T100253631Z"]
+    image_names = ["2025-04-07T055924556Z", "2025-04-08T085807477Z", "2025-04-07T045859245Z"]
     fits_dir = "fits_files"
     txt_path = os.path.join(fits_dir, "timestamp.txt")
 
@@ -595,6 +595,8 @@ def main():
     for entry in dataset:
         star_data = entry["star_data"]
         obs_time = entry["obs_time"]
+        
+        print(star_data.shape)
 
         stars_metric = celestial_to_ecef(star_data, time_str=obs_time.isot)
 
@@ -623,23 +625,41 @@ def main():
 
     axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.5, origin=[0, 0, 0])
 
+    
+    all_obj_norm = []
+
+    for entry in dataset:
+        star_data = entry["star_data"]
+        obs_time = entry["obs_time"]
+
+        print(star_data.shape)
+
+        star_data[:, 4] /= star_data[:, 4].max()
+        star_data[:, 4] += 10
+        stars_metric_norm = celestial_to_ecef(star_data, time_str=obs_time.isot)
+
+        all_obj_norm.append(stars_metric_norm)
+
+    all_obj_norm = np.vstack(all_obj_norm)
+    print(all_obj_norm.shape)
+
     # Visualize the transformed coordinate frame
-    star_dist_norm = star_data[:, 4] / star_data[:, 4].max()
-    star_dist_norm += 10
+    # star_dist_norm = star_data[:, 4] / star_data[:, 4].max()
+    # star_dist_norm += 10
 
-    x_norm, y_norm, z_norm = celestial_to_cartesian(star_data[:, 2], star_data[:, 3], star_dist_norm)
-    star_data[:, 4] = star_dist_norm
-    stars_metric_norm = celestial_to_ecef(star_data, obs_time.isot)
+    # x_norm, y_norm, z_norm = celestial_to_cartesian(star_data[:, 2], star_data[:, 3], star_dist_norm)
+    # star_data[:, 4] = star_dist_norm
+    # stars_metric_norm = celestial_to_ecef(star_data, obs_time.isot)
 
 
-    pc = np.vstack((x_norm, y_norm, z_norm)).T
-    pc_adj = stars_metric_norm
+    # pc = np.vstack((x_norm, y_norm, z_norm)).T
+    pc_adj = all_obj_norm
     # print(pc.shape)
 
     # Create Open3D point cloud
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(pc)
-    pcd.colors = o3d.utility.Vector3dVector(np.ones((len(pc), 3)) * [1, 0, 0])
+    # pcd = o3d.geometry.PointCloud()
+    # pcd.points = o3d.utility.Vector3dVector(pc)
+    # pcd.colors = o3d.utility.Vector3dVector(np.ones((len(pc), 3)) * [1, 0, 0])
 
     pcd_adj = o3d.geometry.PointCloud()
     pcd_adj.points = o3d.utility.Vector3dVector(pc_adj)
@@ -649,7 +669,7 @@ def main():
     
 
     # Create coordinate frame (origin)
-    o3d.visualization.draw_geometries([frame, axis, pcd, pcd_adj, earth])
+    o3d.visualization.draw_geometries([frame, axis, pcd_adj, earth])
 
 
 if __name__ == "__main__":

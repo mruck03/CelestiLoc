@@ -12,6 +12,8 @@ from scipy.spatial.transform import Rotation as R
 from scipy.optimize import least_squares, minimize
 from astropy.time import Time
 from datetime import datetime, timezone, timedelta
+import matplotlib.pyplot as plt
+import copy
 
 
 def read_rdls_file(file_path):
@@ -378,7 +380,7 @@ def residual_quaternion(params, img_pts, star_pts, camera_matrix):
     dot_products = np.sum(star_rays_cam * img_rays, axis=1)
     angles = np.arccos(np.clip(dot_products, -1.0, 1.0))
 
-    print(f"Current Lat: {np.degrees(lat)}, Lon: {np.degrees(lon)}, Residual: {np.sum(angles**2) + sum_error + missing_penalty}")
+    # print(f"Current Lat: {np.degrees(lat)}, Lon: {np.degrees(lon)}, Residual: {np.sum(angles**2) + sum_error + missing_penalty}")
 
     return np.sum(angles**2) + sum_error + missing_penalty
     
@@ -430,55 +432,6 @@ def residual_quaternion_R(params, opt_t ,img_pts, star_pts, camera_matrix):
 
     return sum_error + missing_penalty
 
-# def residual_quaternion_t(params, quat, img_pts, star_pts, camera_matrix):
-#     """
-#       OLD DOES NOT WORK!!!!!
-#     Computes the residuals between transformed points in frame A and points in frame B using a quaternion.
-
-#     Args:
-#         params (np.ndarray): Optimization parameters (first 4 values are quaternion, last 3 are translation).
-#         img_pts (np.ndarray): Array of shape (N, 2) representing indexes of image
-#         points_b (np.ndarray): Array of shape (N, 3) representing points of stars in world frame
-
-#     Returns:
-#         np.ndarray: Residuals (differences) between transformed points_a and points_b.
-#     """
-#     # Extract quaternion and translation parameters
-#     lat, lon = params
-
-
-#     t = lla_to_ecef(lat, lon)
-#     cam_2_world = quaternion_to_transformation_matrix(quat, t)
-
-#     world_2_cam = np.linalg.inv(cam_2_world)
-
-#     star_pts_homo = np.vstack((star_pts.T, np.ones(star_pts.shape[0])))
-#     star_pts_cam = world_2_cam[:3, :] @ star_pts_homo
-
-#     in_front = star_pts_cam[2, :] > 0
-#     if np.sum(in_front) == 0:
-#         return 1e9  # Penalize bad poses heavily
-
-#     star_pts_cam = star_pts_cam[:, in_front]
-#     img_pts_filtered = img_pts[in_front]
-
-#     proj_points = camera_matrix @ star_pts_cam[:3, :]
-#     proj_points = (proj_points[:2, :] / proj_points[2, :]).T
-
-#     # Compute reprojection errors
-#     errors = np.linalg.norm(img_pts_filtered - proj_points, axis=1)
-
-#     # Compute the mean error
-#     sum_error = np.sum(errors)
-
-#     # mean_error, _ = compute_reprojection_error(star_pts, img_pts, rvec, t, camera_matrix)
-#     # print(f"Current Lat: {np.degrees(lat)}, Lon: {np.degrees(lon)}, Residual: {mean_error}")
-#     missing_penalty = 100000 * (star_pts.shape[0] - np.sum(in_front))
-#     # print(np.sum(in_front))
-#     # print(sum_error + missing_penalty)
-#     print(f"Current Lat: {np.degrees(lat)}, Lon: {np.degrees(lon)}, Residual: {sum_error + missing_penalty}")
-
-#     return (sum_error + missing_penalty)
 
 def residual_quaternion_t(params, quat, img_pts, star_pts, camera_matrix):
     """
@@ -517,7 +470,7 @@ def residual_quaternion_t(params, quat, img_pts, star_pts, camera_matrix):
     dot_products = np.sum(star_rays_cam * img_rays, axis=1)
     angles = np.arccos(np.clip(dot_products, -1.0, 1.0))
 
-    print(f"Current Lat: {np.degrees(lat)}, Lon: {np.degrees(lon)}, Residual: {np.sum(angles**2)}")
+    # print(f"Current Lat: {np.degrees(lat)}, Lon: {np.degrees(lon)}, Residual: {np.sum(angles**2)}")
 
     return np.sum(angles**2)# or np.mean(angles) if needed
 
@@ -581,6 +534,277 @@ def solve_least_squares(object_points, image_points, camera_matrix, dist_coeffs=
 
     return optimized_quat, optimized_t
 
+def is_camera_facing_down(quat, lat, lon):
+
+    # Get ECEF unit "up" direction at this lat/lon
+    up_vector = lla_to_ecef(lat, lon)
+    up_vector /= np.linalg.norm(up_vector)
+
+    # Get camera's forward direction in ECEF
+    rot = R.from_quat(quat)
+    cam_forward = rot.apply(np.array([0, 0, 1]))  # camera looks along +Z
+
+    # If dot < 0 → facing into Earth
+    dot = cam_forward @ up_vector
+    return dot < 0
+
+def solve_rotation_svd(image_points, star_points, camera_matrix, tvec):
+    """
+    Solves for optimal rotation that aligns camera rays to star directions using SVD.
+
+    Parameters:
+        image_points: (N, 2) 2D image coordinates (undistorted)
+        star_points: (N, 3) 3D star positions in ECEF (already aligned to time)
+        camera_matrix: (3, 3) camera intrinsics
+
+    Returns:
+        Quaternion representing rotation from camera to world (ECEF)
+    """
+    N = image_points.shape[0]
+
+    # Step 1: Back-project image points to normalized rays in camera frame
+    img_pts_h = np.hstack([image_points, np.ones((N, 1))])  # (N, 3)
+    cam_rays = (np.linalg.inv(camera_matrix) @ img_pts_h.T).T  # (N, 3)
+    cam_rays /= np.linalg.norm(cam_rays, axis=1, keepdims=True)
+
+    # Step 2: Transform Stars into Camera frame and Normalize star vectors
+    tvec = np.asarray(tvec).reshape(1, 3)
+    star_dirs = star_points - tvec
+    star_dirs /= np.linalg.norm(star_dirs, axis=1, keepdims=True)
+
+    # Step 3: Compute SVD of covariance matrix
+    H = cam_rays.T @ star_dirs  # 3x3
+    U, S, Vt = np.linalg.svd(H)
+    R_opt = Vt.T @ U.T
+
+    # Fix improper rotation (reflection)
+    if np.linalg.det(R_opt) < 0:
+        Vt[-1, :] *= -1
+        R_opt = Vt.T @ U.T
+
+    # Step 4: Convert to quaternion
+    quat = R.from_matrix(R_opt).as_quat()  # (x, y, z, w)
+    return quat
+
+def wrap_longitude(lon):
+    # Wrap to [-π, π]
+    return ((lon + np.pi) % (2 * np.pi)) - np.pi
+
+def clamp_latitude(lat):
+    # Clamp to [-π/2, π/2]
+    return np.clip(lat, -np.pi / 2, np.pi / 2)
+
+def filter_visible_stars(lat, lon, star_points_ecef):
+    # 1. Observer ECEF position
+    obs_ecef = lla_to_ecef(lat, lon)
+
+    # 2. Vector to each star from observer
+    vectors_to_stars = star_points_ecef - obs_ecef  # shape (N, 3)
+    vectors_to_stars /= np.linalg.norm(vectors_to_stars, axis=1, keepdims=True)
+
+    # 3. Observer "up" direction
+    observer_up = obs_ecef / np.linalg.norm(obs_ecef)
+
+    # 4. Compute dot product
+    dot_products = vectors_to_stars @ observer_up
+
+    # 5. Keep stars with positive dot product (i.e., above the horizon)
+    visible_mask = dot_products > 0
+
+    return visible_mask
+
+class Particle:
+    def __init__(self, lat, lon, quat=np.array([0, 0, 0, 1]), weight=1.0):
+        self.lat = lat
+        self.lon = lon
+        self.weight = weight
+        self.quat = quat / np.linalg.norm(quat)
+
+class ParticleFilter:
+    def __init__(self, num_particles):
+        self.particles = []
+        for _ in range(num_particles):
+            #Sample latitude and lon uniformly over the globe
+            lat = np.arcsin(np.random.uniform(-1, 1)) 
+            lon = np.random.uniform(-np.pi, np.pi)
+
+            self.particles.append(Particle(lat, lon))
+
+    def predict(self, lat_std, lon_std):
+        for p in self.particles:
+            p.lat += np.random.normal(0, lat_std)
+            p.lon += np.random.normal(0, lon_std)
+
+            # Apply wrapping/clamping
+            p.lat = clamp_latitude(p.lat)
+            p.lon = wrap_longitude(p.lon)
+
+        # unique_positions = set((round(p.lat, 5), round(p.lon, 5)) for p in self.particles)
+        # print(f"Unique particle positions: {len(unique_positions)}")
+
+    def update_weights(self, image_points, star_points, camera_matrix, scale=1):
+        weights = []
+        # for p in tqdm(self.particles, desc="Updating particles"):
+        residuals = []
+        MIN_VISIBLE_RATIO = 0.7
+        min_visible = max(int(MIN_VISIBLE_RATIO * len(star_points)), 3)
+        bad_residuals = []
+        for p in self.particles:
+            # Solve for best rotation given p.lat, p.lon
+            # result = minimize(
+            #     lambda q: residual_quaternion_R(q, (p.lat, p.lon), image_points, star_points, camera_matrix),
+            #     initial_guess_quat,
+            #     method='L-BFGS-B',
+            #     bounds=list(zip(np.full(4, quat_bounds[0]), np.full(4, quat_bounds[1]))),
+            #     options={'maxiter': 100}
+            # )
+            tvec = lla_to_ecef(p.lat, p.lon)
+            quat = solve_rotation_svd(image_points, star_points, camera_matrix, tvec)
+            p.quat = quat / np.linalg.norm(quat)
+
+            visible_mask = filter_visible_stars(p.lat, p.lon, star_points)
+            
+
+            if np.sum(visible_mask) < min_visible or is_camera_facing_down(p.quat, p.lat, p.lon):
+                # residuals.append(BAD_RESIDUAL)
+                bad_residuals.append(True)
+            else:
+                bad_residuals.append(False)
+
+            stars_visible = star_points[visible_mask]
+            images_visible = image_points[visible_mask]
+            # Now compute final weight using residual_quaternion_t (or the full residual)
+            residual = residual_quaternion_t([p.lat, p.lon], p.quat, images_visible, stars_visible, camera_matrix)
+            residuals.append(residual)
+
+
+       
+        bad_residuals_mask = np.array(bad_residuals)
+        residuals = np.array(residuals)
+        residuals[bad_residuals_mask] = np.max(residuals) + np.mean(residuals) + 100000
+
+        res_min = np.min(residuals)
+        res_max = np.max(residuals)
+        res_range = res_max - res_min if res_max != res_min else 1.0
+
+        print(f"res_range: {res_range}")
+
+        residuals = (residuals - res_min) / res_range
+        weights = np.exp(-residuals * scale)
+
+        for i, p in enumerate(self.particles):
+            p.weight = weights[i]
+
+        total_weight = np.sum(weights)
+        if total_weight == 0:
+            # Avoid division by zero — assign equal weights
+            for p in self.particles:
+                p.weight = 1.0 / len(self.particles)
+        else:
+            # Normalize with NumPy for accuracy
+            normalized_weights = np.array([w / total_weight for w in weights])
+            for i, p in enumerate(self.particles):
+                p.weight = normalized_weights[i]
+
+
+    # def resample(self):
+    #     weights = [p.weight for p in self.particles]
+    #     # print(np.sum(weights))
+    #     indices = np.random.choice(len(self.particles), size=len(self.particles), p=weights)
+    #     self.particles = [self.particles[i] for i in indices]
+
+    def N_eff(self):
+        weights = np.array([p.weight for p in self.particles], dtype=np.float64)
+        total = np.sum(weights)
+
+        if total == 0 or np.isnan(total):
+            return 0.0
+
+        weights /= total
+        return 1.0 / np.sum(weights**2)
+
+    def resample(self):
+        """
+        Low variance (systematic) resampling for particle filter.
+        """
+        N = len(self.particles)
+        weights = np.array([p.weight for p in self.particles])
+        weights /= np.sum(weights)  # Normalize to sum to 1
+
+        # Cumulative sum
+        cumulative_sum = np.cumsum(weights)
+        cumulative_sum[-1] = 1.0  # Ensure total sum is exactly 1.0
+
+        r = np.random.uniform(0, 1/N)
+        indexes = np.zeros(N, dtype=int)
+
+        i, j = 0, 0
+        for m in range(N):
+            u = r + m / N
+            while u > cumulative_sum[j]:
+                j += 1
+            indexes[i] = j
+            i += 1
+
+        # Resample by deep-copying selected particles
+        self.particles = [copy.deepcopy(self.particles[idx]) for idx in indexes]
+
+
+    def estimate(self):
+        lats = np.array([p.lat for p in self.particles])
+        lons = np.array([p.lon for p in self.particles])
+        weights = np.array([p.weight for p in self.particles])
+
+        # Weighted mean latitude (not wrapped — use regular average)
+        mean_lat = np.average(lats, weights=weights)
+
+        # Wrapped average for longitude
+        sin_lon = np.sin(lons)
+        cos_lon = np.cos(lons)
+        mean_sin = np.average(sin_lon, weights=weights)
+        mean_cos = np.average(cos_lon, weights=weights)
+        mean_lon = np.arctan2(mean_sin, mean_cos)  # Result ∈ [-π, π]
+
+        return mean_lat, mean_lon
+
+def visualize_particles(particles, step=None, estimate=None):
+    """
+    Visualize particles on a 2D map projection of the Earth.
+    
+    Parameters:
+        particles (list): List of Particle objects.
+        step (int): Optional. Current iteration number for labeling.
+        estimate (tuple): Optional. Estimated (lat, lon) to mark.
+    """
+    lats = np.array([np.degrees(p.lat) for p in particles])
+    lons = np.array([np.degrees(p.lon) for p in particles])
+    weights = np.array([p.weight for p in particles])
+
+    plt.figure(figsize=(10, 5))
+    ax = plt.gca()
+    ax.set_facecolor("black")
+
+    # Plot particles
+    plt.scatter(lons, lats, c=weights, cmap='cool', s=20, alpha=0.8, edgecolor='k', linewidths=0.3)
+
+    # Plot estimated location
+    if estimate is not None:
+        est_lat_deg = np.degrees(estimate[0])
+        est_lon_deg = np.degrees(estimate[1])
+        plt.scatter(est_lon_deg, est_lat_deg, color='yellow', s=80, marker='*', label='Estimated Pose')
+
+    plt.xlim(-180, 180)
+    plt.ylim(-90, 90)
+    plt.xlabel("Longitude (deg)")
+    plt.ylabel("Latitude (deg)")
+    title = f"Particle Distribution"
+    if step is not None:
+        title += f" - Step {step}"
+    plt.title(title)
+    plt.grid(True, linestyle='--', alpha=0.5)
+    plt.legend(loc='upper right')
+    plt.tight_layout()
+    plt.show()
 
 def main():
     image_names = ["2025-04-07T055924556Z", "2025-04-08T085807477Z", "2025-04-07T045859245Z"]
@@ -608,11 +832,95 @@ def main():
     image_points = np.vstack(all_img_pts)
 
     # Solve
-    quat, pos = solve_least_squares(object_points, image_points, K)
-    t = lla_to_ecef(pos[0], pos[1])
+    # quat, pos = solve_least_squares(object_points, image_points, K)
+
+    N = 500
+
+    pf = ParticleFilter(
+        num_particles=N
+    )
+
+    # Run particle filter for a fixed number of iterations
+    initial_lat_std = 1
+    initial_lon_std = 1
+    num_iters = 200
+    num_stars = 80
+
+    #Vizualize
+    axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.5, origin=[0, 0, 0])
+ 
+    all_obj_norm = []
+
+    for entry in dataset:
+        star_data = entry["star_data"]
+        obs_time = entry["obs_time"]
+
+        print(star_data.shape)
+
+        star_data[:, 4] /= star_data[:, 4].max()
+        star_data[:, 4] += 10
+        stars_metric_norm = celestial_to_ecef(star_data, time_str=obs_time.isot)
+
+        all_obj_norm.append(stars_metric_norm)
+
+    all_obj_norm = np.vstack(all_obj_norm)
+    pc_adj = all_obj_norm
+
+    pcd_adj = o3d.geometry.PointCloud()
+    pcd_adj.points = o3d.utility.Vector3dVector(pc_adj)
+    pcd_adj.colors = o3d.utility.Vector3dVector(np.ones((len(pc_adj), 3)) * [0, 0, 1])
+
+    earth = o3d.geometry.TriangleMesh.create_sphere(radius=1.0, resolution=20)
+
+    for i in tqdm(range(num_iters)):
+        lat_std = initial_lat_std
+        lon_std = initial_lon_std
+        pf.predict(lat_std=np.deg2rad(lat_std), lon_std=np.deg2rad(lon_std))
+
+        #subsample a random amount of stars (num_stars). Stars are weighted by distance
+        distances = np.linalg.norm(object_points, axis=1)
+        weights = 1 / (distances + 1e-8)
+        weights /= weights.sum()
+        idx_stars = np.random.choice(len(object_points), num_stars, replace=False, p = weights)
+
+        # pf.update_weights(image_points[idx_stars], object_points[idx_stars], K, scale=5)
+        pf.update_weights(image_points, object_points, K, scale=10)
+        
+        #Print to see it change over time
+        lat, lon = pf.estimate()
+        # print("Estimated Position (Lat, Lon):", np.degrees(np.array([lat, lon])))
+        # print(len(pf.particles))
+
+        if i % 50 == 0:
+            visualize_particles(pf.particles, step=i, estimate=(lat, lon))
+            # frames = []
+            # for p in pf.particles:
+            #     t = lla_to_ecef(p.lat, p.lon)
+            #     T = quaternion_to_transformation_matrix(p.quat, t/np.linalg.norm(t))
+            #     pred_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.7)
+            #     pred_frame.transform(T)
+            #     frames.append(pred_frame)
+            # o3d.visualization.draw_geometries(frames + [axis, pcd_adj, earth])
+
+        print(N*0.8)
+        print(pf.N_eff())
+
+        if pf.N_eff() < N*0.8:
+            print("resampling!!!!")
+            pf.resample()
+
+    # Final pose estimate
+    lat, lon = pf.estimate()
+
+
+
+    t = lla_to_ecef(lat, lon)
+
+    quat = solve_rotation_svd(image_points, object_points, K, t)
+    quat = quat / np.linalg.norm(quat)
 
     print("Estimated Quaternion:", quat)
-    print("Estimated Position (Lat, Lon):", np.degrees(pos))
+    print("Estimated Position (Lat, Lon):", np.degrees(np.array([lat, lon])))
 
     T = quaternion_to_transformation_matrix(quat, t/np.linalg.norm(t))
 
@@ -641,25 +949,7 @@ def main():
         all_obj_norm.append(stars_metric_norm)
 
     all_obj_norm = np.vstack(all_obj_norm)
-    print(all_obj_norm.shape)
-
-    # Visualize the transformed coordinate frame
-    # star_dist_norm = star_data[:, 4] / star_data[:, 4].max()
-    # star_dist_norm += 10
-
-    # x_norm, y_norm, z_norm = celestial_to_cartesian(star_data[:, 2], star_data[:, 3], star_dist_norm)
-    # star_data[:, 4] = star_dist_norm
-    # stars_metric_norm = celestial_to_ecef(star_data, obs_time.isot)
-
-
-    # pc = np.vstack((x_norm, y_norm, z_norm)).T
     pc_adj = all_obj_norm
-    # print(pc.shape)
-
-    # Create Open3D point cloud
-    # pcd = o3d.geometry.PointCloud()
-    # pcd.points = o3d.utility.Vector3dVector(pc)
-    # pcd.colors = o3d.utility.Vector3dVector(np.ones((len(pc), 3)) * [1, 0, 0])
 
     pcd_adj = o3d.geometry.PointCloud()
     pcd_adj.points = o3d.utility.Vector3dVector(pc_adj)

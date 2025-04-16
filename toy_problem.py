@@ -99,7 +99,10 @@ def main():
     N = 500
 
     pf = ParticleFilter(
-        num_particles=N
+        num_particles=N,
+        image_points=image_points,
+        star_points=star_points,
+        camera_matrix=K
     )
 
     # Run particle filter for a fixed number of iterations
@@ -111,7 +114,7 @@ def main():
     for i in tqdm(range(num_iters)):
         lat_std = initial_lat_std
         lon_std = initial_lon_std
-        pf.predict(lat_std=np.deg2rad(lat_std), lon_std=np.deg2rad(lon_std))
+        pf.predict(np.deg2rad(lat_std), np.deg2rad(lon_std), image_points, star_points, K)
 
         #subsample a random amount of stars (num_stars). Stars are weighted by distance
         distances = np.linalg.norm(star_points, axis=1)
@@ -119,7 +122,8 @@ def main():
         weights /= weights.sum()
         idx_stars = np.random.choice(len(star_points), num_stars, replace=False, p = weights)
 
-        pf.update_weights(image_points[idx_stars], star_points[idx_stars], K, scale=5)
+        # pf.update_weights(image_points[idx_stars], star_points[idx_stars], K, scale=5)
+        pf.update_weights(image_points, star_points, K, scale=5)
         
         #Print to see it change over time
         lat, lon = pf.estimate()
@@ -139,10 +143,10 @@ def main():
 
 
 
-        print(N*0.8)
+        print(N*0.7)
         print(pf.N_eff())
 
-        if pf.N_eff() < N*0.8:
+        if pf.N_eff() < N*0.7:
             print("resampling!!!!")
             pf.resample()
 

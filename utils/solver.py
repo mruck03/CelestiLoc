@@ -150,14 +150,17 @@ def filter_visible_stars(lat, lon, star_points_ecef):
 
 
 class Particle:
-    def __init__(self, lat, lon, quat=np.array([0, 0, 0, 1]), weight=1.0):
+    def __init__(self, lat, lon, pitch, bearing, roll, quat=np.array([0, 0, 0, 1]), weight=1.0):
         self.lat = lat
         self.lon = lon
+        self.pitch = pitch
+        self.bearing = bearing
+        self.roll = roll
         self.weight = weight
         self.quat = quat / np.linalg.norm(quat)
 
 class ParticleFilter:
-    def __init__(self, num_particles, image_points, star_points, camera_matrix, percent_visible=0.8):
+    def __init__(self, pitch, bearing, roll, num_particles, image_points, star_points, camera_matrix, percent_visible=0.8):
         self.particles = []
         min_visible = max(int(percent_visible * len(star_points)), 3)
         while len(self.particles) < num_particles:
@@ -169,16 +172,23 @@ class ParticleFilter:
             if np.sum(visible_mask) < min_visible:
                 continue
 
-            tvec = lla_to_ecef(lat, lon)
-            quat = solve_rotation_svd(image_points, star_points, camera_matrix, tvec)
-            quat = quat / np.linalg.norm(quat)
 
-            if is_camera_facing_down(quat, lat, lon):
-                continue
+            camera_rotation = R.from_euler('zyx', [bearing, roll, pitch], degrees=False).as_matrix()
+            # Combine camera-to-ENU rotation (rotated direction of camera in ENU)
+            camera_in_enu =  camera_rotation  @ axis_to_cam @ np.eye(3)
+
+
+            quat = R.from_matrix(enu_axes(lat, lon) @ camera_in_enu).as_quat()
+            # tvec = lla_to_ecef(lat, lon)
+            # quat = solve_rotation_svd(image_points, star_points, camera_matrix, tvec)
+            # quat = quat / np.linalg.norm(quat)
+
+            # if is_camera_facing_down(quat, lat, lon):
+            #     continue
             
-            self.particles.append(Particle(lat, lon, quat))
+            self.particles.append(Particle(lat, lon, pitch, bearing, roll, quat))
 
-    def predict(self, lat_std, lon_std, image_points, star_points, camera_matrix, percent_visible=0.8):
+    def predict(self, lat_std, lon_std, pitch_std, bearing_std, roll_std, image_points, star_points, camera_matrix, percent_visible=0.8):
 
         min_visible = max(int(percent_visible * len(star_points)), 3)
         for p in self.particles:
@@ -190,17 +200,29 @@ class ParticleFilter:
                 continue
 
             # Solve for rotation at proposed position
-            tvec = lla_to_ecef(lat, lon)
-            quat = solve_rotation_svd(image_points, star_points, camera_matrix, tvec)
-            quat = quat / np.linalg.norm(quat)
+            pitch = p.pitch + np.random.normal(0, pitch_std)
+            bearing = p.bearing + np.random.normal(0, bearing_std)
+            roll = p.roll + np.random.normal(0, roll_std)
+            camera_rotation = R.from_euler('zyx', [bearing, roll, pitch], degrees=False).as_matrix()
+            # Combine camera-to-ENU rotation (rotated direction of camera in ENU)
+            camera_in_enu =  camera_rotation  @ axis_to_cam @ np.eye(3)
 
-            # Reject if camera would be facing into Earth
+
+            quat = R.from_matrix(enu_axes(lat, lon) @ camera_in_enu).as_quat()
+            # tvec = lla_to_ecef(lat, lon)
+            # quat = solve_rotation_svd(image_points, star_points, camera_matrix, tvec)
+            # quat = quat / np.linalg.norm(quat)
+
+            # # Reject if camera would be facing into Earth
             if is_camera_facing_down(quat, lat, lon):
                 continue
 
             # Accept
             p.lat = lat
             p.lon = lon
+            p.pitch = pitch
+            p.bearing = bearing
+            p.roll = roll
             p.quat = quat
 
 
@@ -213,11 +235,12 @@ class ParticleFilter:
             residual = residual_quaternion_t([p.lat, p.lon], p.quat, image_points, star_points, camera_matrix) #TODO: Change to Reprojection Error!
             residuals.append(residual)
 
+        residuals = np.array(residuals)
         res_min = np.min(residuals)
         res_max = np.max(residuals)
         res_range = res_max - res_min if res_max != res_min else 1.0
 
-        print(f"res_range: {res_range}")
+        # print(f"res_range: {res_range}")
 
         residuals = (residuals - res_min) / res_range
         weights = np.exp(-residuals * scale)
@@ -327,5 +350,27 @@ def visualize_particles(particles, step=None, estimate=None):
     plt.title(title)
     plt.grid(True, linestyle='--', alpha=0.5)
     plt.legend(loc='upper right')
+    plt.tight_layout()
+    plt.show()
+
+def visualize_pitch_yaw_chart(particles, step=None):
+    """
+    Plots particles' pitch vs yaw as a scatter plot, colored by weight.
+    """
+    yaws = np.array([np.degrees(p.bearing) for p in particles])     # in degrees
+    pitches = np.array([np.degrees(p.pitch) for p in particles])  # in degrees
+    weights = np.array([p.weight for p in particles])
+
+    plt.figure(figsize=(8, 6))
+    sc = plt.scatter(yaws, pitches, c=weights, cmap='plasma', s=40, edgecolor='k', alpha=0.8)
+
+    plt.colorbar(sc, label='Particle Weight')
+    plt.xlabel("Yaw (degrees)")
+    plt.ylabel("Pitch (degrees)")
+    title = "Pitch vs Yaw of Particles"
+    if step is not None:
+        title += f" - Step {step}"
+    plt.title(title)
+    plt.grid(True, linestyle='--', alpha=0.5)
     plt.tight_layout()
     plt.show()

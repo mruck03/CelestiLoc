@@ -16,6 +16,17 @@ import matplotlib.pyplot as plt
 import copy
 from scipy.spatial import cKDTree
 
+axis_to_cam = np.array([[1, 0, 0],
+                    [0, 0, 1],
+                    [0, -1, 0]])
+
+def enu_axes(lat, lon):
+    east = np.array([-np.sin(lon), np.cos(lon), 0])
+    north = np.array([-np.sin(lat)*np.cos(lon), -np.sin(lat)*np.sin(lon), np.cos(lat)])
+    up = np.array([np.cos(lat)*np.cos(lon), np.cos(lat)*np.sin(lon), np.sin(lat)])
+
+    return np.stack([east, north, up], axis=1)  # ENU → ECEF
+
 def viz_projection(image_pts, proj_pts, image=None, figsize=(8, 8)):
     """
     Visualize the projection difference between actual and projected image points.
@@ -67,9 +78,9 @@ def celestial_to_ecef(star_data, time_str="2025-04-01T04:00:00"):
     gst_rad = gst.to(u.rad)
 
     rotation_matrix = np.array([
-        [ np.cos(-gst_rad), -np.sin(-gst_rad), 0],
-        [ np.sin(-gst_rad),  np.cos(-gst_rad), 0],
-        [ 0,                0,                1]
+        [ np.cos(gst_rad),  np.sin(gst_rad), 0],
+        [-np.sin(gst_rad),  np.cos(gst_rad), 0],
+        [ 0,                0,               1]
     ])
 
     x, y, z = celestial_to_cartesian(star_data[:, 2], star_data[:, 3], star_data[:, 4])
@@ -80,13 +91,13 @@ def celestial_to_ecef(star_data, time_str="2025-04-01T04:00:00"):
 
     return star_coords_adj.T
 
-def plot_3d_pose(dataset, quat=None, tvec=None):
+def plot_3d_pose(dataset, frames):
     
     #Vizualize
-    if np.all(quat) != None:
-        T = quaternion_to_transformation_matrix(quat, tvec/np.linalg.norm(tvec))
-        frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.7)
-        frame.transform(T)
+    # if np.all(quat) != None:
+    #     T = quaternion_to_transformation_matrix(quat, tvec/np.linalg.norm(tvec))
+    #     frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.7)
+    #     frame.transform(T)
 
     axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.5, origin=[0, 0, 0])
 
@@ -116,10 +127,7 @@ def plot_3d_pose(dataset, quat=None, tvec=None):
     
 
     # Create coordinate frame (origin)
-    if np.all(quat) != None:
-        o3d.visualization.draw_geometries([frame, axis, pcd_adj, earth])
-    else:
-        o3d.visualization.draw_geometries([axis, pcd_adj, earth])
+    o3d.visualization.draw_geometries(frames + [axis, pcd_adj, earth])
 
 
 def quaternion_to_transformation_matrix(quaternion, translation):

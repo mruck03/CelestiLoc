@@ -31,8 +31,8 @@ D = np.array([-0.391719060689475, 0.133262225859808, 0, 0])
 
 
 def main():
-    image_names = ["2025-04-07T055924556Z", "2025-04-08T085807477Z", "2025-04-07T045859245Z", "2025-04-15T015950238Z", "2025-04-12T085905112Z"]
-    # image_names = ["2025-04-15T015950238Z"]
+    image_names = ["2025-04-07T055924556Z", "2025-04-08T085807477Z", "2025-04-07T045859245Z", "2025-04-15T015950238Z", "2025-04-12T085905112Z", "2025-04-17T035648703Z"]
+    # image_names = ["2025-04-07T055924556Z", "2025-04-08T085807477Z", "2025-04-07T045859245Z", "2025-04-15T015950238Z", "2025-04-12T085905112Z"]
     fits_dir = "fits_files"
     txt_path = os.path.join(fits_dir, "timestamp.txt")
 
@@ -105,75 +105,83 @@ def main():
 
 
     # Run particle filter for a fixed number of iterations
-    initial_lat_std = 1
+    initial_lat_std = 2
     initial_lon_std = 1
-    initial_pitch_std = 0.1
-    initial_bearing_std = 0.1
-    initial_roll_std = 0.1
-    num_iters = 100
-    num_stars = 30
+    initial_pitch_std = 0.04
+    initial_bearing_std = 0.04
+    initial_roll_std = 0.04
+    num_iters = 1000
 
-    num_trials = 1
+    num_trials = 3
+    num_stars = [int((0.1 * len(object_points)))]
+    decay = 0.99
 
-    out_list = []
-    for i in tqdm(range(num_trials)):
-        pf = ParticleFilter(
-            bearing=bearing,
-            pitch=pitch,
-            roll=roll,
-            num_particles=N,
-            image_points=image_points,
-            star_points=object_points,
-            camera_matrix=K,
-            percent_visible=0.99
-        )
-        for i in tqdm(range(num_iters)):
-            lat_std = initial_lat_std * (0.99 ** i)
-            lon_std = initial_lon_std * (0.99 ** i)
-            pitch_std = initial_pitch_std * (0.99 ** i)
-            bearing_std = initial_bearing_std * (0.99 ** i)
-            roll_std = initial_roll_std * (0.99 ** i)
-            pf.predict(np.deg2rad(lat_std), np.deg2rad(lon_std), np.deg2rad(pitch_std), np.deg2rad(bearing_std), np.deg2rad(roll_std), image_points, object_points, K, percent_visible=0.99)
+    
+    for i in tqdm(range(len(num_stars))):
+        out_list = []
+        for k in tqdm(range(num_trials)):
+            pf = ParticleFilter(
+                bearing=bearing,
+                pitch=pitch,
+                roll=roll,
+                num_particles=N,
+                image_points=image_points,
+                star_points=object_points,
+                camera_matrix=K,
+                percent_visible=0.99
+            )
+            for j in range(num_iters):
+                lat_std = initial_lat_std * (decay ** j)
+                lon_std = initial_lon_std * (decay ** j)
+                pitch_std = initial_pitch_std * (decay ** j)
+                bearing_std = initial_bearing_std * (decay ** j)
+                roll_std = initial_roll_std * (decay ** j)
+                pf.predict(np.deg2rad(lat_std), np.deg2rad(lon_std), np.deg2rad(pitch_std), np.deg2rad(bearing_std), np.deg2rad(roll_std), image_points, object_points, K, percent_visible=0.99)
 
-            #subsample a random amount of stars (num_stars). Stars are weighted by distance
-            distances = np.linalg.norm(object_points, axis=1)
-            weights = 1 / (distances + 1e-8)
-            weights /= weights.sum()
-            idx_stars = np.random.choice(len(object_points), num_stars, replace=False, p = weights)
+                #subsample a random amount of stars (num_stars). Stars are weighted by distance
+                distances = np.linalg.norm(object_points, axis=1)
+                distances = (distances - distances.min()) / (distances.max() - distances.min() + 1e-8)
+                weights = 1 / (distances + 1e-8)
+                weights /= weights.sum()
+                if num_stars[i] != -1:
+                    idx_stars = np.random.choice(len(object_points), num_stars[i], replace=False, p = weights)
+                    pf.update_weights(image_points[idx_stars], object_points[idx_stars], K, scale=30)
+                else:
+                    pf.update_weights(image_points, object_points, K, scale=30)
+                # pf.update_weights(image_points, object_points, K, scale=20)
+                
+                #Print to see it change over time
+                lat, lon = pf.estimate()
+                # print("Estimated Position (Lat, Lon):", np.degrees(np.array([lat, lon])))
+                # print(len(pf.particles))
 
-            pf.update_weights(image_points[idx_stars], object_points[idx_stars], K, scale=30)
-            # pf.update_weights(image_points, object_points, K, scale=20)
-            
-            #Print to see it change over time
+                # if i % 250 == 0:
+                #     visualize_particles(pf.particles, step=i, estimate=(lat, lon))
+                    # visualize_pitch_yaw_chart(pf.particles, i)
+                    # frames = []
+                    # for p in pf.particles:
+                    #     t = lla_to_ecef(p.lat, p.lon)
+                    #     T = quaternion_to_transformation_matrix(p.quat, t/np.linalg.norm(t))
+                    #     pred_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.7)
+                    #     pred_frame.transform(T)
+                    #     frames.append(pred_frame)
+                    # plot_3d_pose(dataset, frames)
+
+                # print(N*0.8)
+                # print(pf.N_eff())
+
+                if pf.N_eff() < N*0.8:
+                    # print("resampling!!!!")
+                    pf.resample()
+
+            # Final pose estimate
             lat, lon = pf.estimate()
-            # print("Estimated Position (Lat, Lon):", np.degrees(np.array([lat, lon])))
-            # print(len(pf.particles))
+            out_list.append([lat, lon])
 
-            if i % 50 == 0:
-                visualize_particles(pf.particles, step=i, estimate=(lat, lon))
-                visualize_pitch_yaw_chart(pf.particles, i)
-                # frames = []
-                # for p in pf.particles:
-                #     t = lla_to_ecef(p.lat, p.lon)
-                #     T = quaternion_to_transformation_matrix(p.quat, t/np.linalg.norm(t))
-                #     pred_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.7)
-                #     pred_frame.transform(T)
-                #     frames.append(pred_frame)
-                # plot_3d_pose(dataset, frames)
-
-            print(N*0.8)
-            print(pf.N_eff())
-
-            if pf.N_eff() < N*0.8:
-                print("resampling!!!!")
-                pf.resample()
-
-        # Final pose estimate
-        lat, lon = pf.estimate()
-        out_list.append([lat, lon])
-
-    out_array = np.array(out_list)
-    lat, lon = np.average(out_array, axis=0)
+        out_array = np.array(out_list)
+        print(out_array)
+        lat, lon = np.average(out_array, axis=0)
+        print("Estimated Position (Lat, Lon):", np.degrees(np.array([lat, lon])))
 
     t = lla_to_ecef(lat, lon)
 
